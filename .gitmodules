@@ -1,0 +1,3 @@
+[submodule "cclnet"]
+	path = cclnet
+	url = https://github.com/shellakajazzy/cclnet
