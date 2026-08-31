@@ -313,6 +313,7 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "davey" },
+    { name = "numpy" },
     { name = "pocket-tts" },
     { name = "py-cord", extra = ["voice"] },
     { name = "vosk" },
@@ -321,6 +322,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "davey", specifier = ">=0.1.6" },
+    { name = "numpy", specifier = ">=2.5.2" },
     { name = "pocket-tts", specifier = ">=3.0.2" },
     { name = "py-cord", extras = ["voice"], git = "https://github.com/Pycord-Development/pycord?rev=refs%2Fpull%2F3159%2Fhead" },
     { name = "vosk", specifier = ">=0.3.45" },
