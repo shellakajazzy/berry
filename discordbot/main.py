@@ -1,3 +1,4 @@
+from vosk.transcriber.transcriber import Transcriber
 import asyncio
 import discord
 from discord.ext import commands
@@ -8,6 +9,12 @@ import os
 import subprocess
 import time
 from vosk import Model, KaldiRecognizer
+
+
+# variables for transcribing the VC
+recognizers = {}
+is_transcribing = mp.Value('i', 1)
+cur_vc = None
 
 
 def vosk_proc(uid, username, vosk_model, is_transcribing, pcm_queue):
@@ -67,35 +74,33 @@ class VoskSink(Sink):
 
     def write(self, data, user):
         # check if the user is defined
-        if user is None or getattr(user, "bot", False):
-            return
+        if user is not None:
+            # get the PCM and user data
+            uid = user.id
+            username = user.display_name
+            pcm = data.pcm
+            if not uid or not username or not pcm: return
 
-        # get the PCM and user data
-        uid = user.id
-        username = user.display_name
-        pcm = data.pcm
-        if not uid or not username or not pcm: return
+            # create recognizer for user if one doesn't already exist
+            if uid not in self.recognizers:
+                self.recognizers[uid] = {}
+                self.recognizers[uid]["queue"] = mp.Queue()
+                self.recognizers[uid]["proc"] = mp.Process(target=vosk_proc, args=(uid, username, self.vosk_model, self.is_transcribing, self.recognizers[uid]["queue"]))
+                self.recognizers[uid]["proc"].start()
+                print(f"Spawned recognizer for {username}")
 
-        # create recognizer for user if one doesn't already exist
-        if uid not in self.recognizers:
-            self.recognizers[uid] = {}
-            self.recognizers[uid]["queue"] = mp.Queue()
-            self.recognizers[uid]["proc"] = mp.Process(target=vosk_proc, args=(uid, username, self.vosk_model, self.is_transcribing, self.recognizers[uid]["queue"]))
-            self.recognizers[uid]["proc"].start()
-            print(f"Spawned recognizer for {username}")
+            recognizer = self.recognizers[uid]
 
-        recognizer = self.recognizers[uid]
-        # print(f"Obtained recognizer for {username}")
-
-        timestamp = int(time.time() * 1000)
-        recognizer["queue"].put_nowait((pcm, timestamp))
+            timestamp = int(time.time() * 1000)
+            recognizer["queue"].put_nowait((pcm, timestamp))
 
 
 
 async def main():
     intents = discord.Intents.default()
     intents.message_content = True
-    bot = commands.Bot(command_prefix="!", intents=intents)
+    intents.voice_states = True
+    bot = commands.Bot(command_prefix=commands.when_mentioned_or("!?"), intents=intents)
 
     # get the Discord bot token and confirm it is real
     token = os.getenv("DISCORD_TOKEN")
@@ -115,45 +120,41 @@ async def main():
     await bot.wait_until_ready()
     print("Bot is logged in")
 
-    print("Beggining connection to VC...")
-    # get the guildID and confirm it is real
-    guildID = os.getenv("DISCORD_TRANSCRIBE_GUILD_ID")
-    if guildID == None:
-        print("Please specify the GUILD ID of the voice channel in the DISCORD_TRANSCRIBE_GUILD_ID environment variable")
-        return
-    guild = bot.get_guild(int(guildID))
-    if guild == None:
-        print(f"Could not find guild with ID {guildID}")
-        return
+    # TODO: current issue is that if the bot is not the first one in the VC, it does not transcribe properly
+    @bot.command()
+    async def join(ctx):
+        # import global variables
+        global is_transcribing, recognizers, cur_vc
+        if cur_vc: await cur_vc.disconnect()
 
-    # get the channelID and confirm it is real
-    channelID = os.getenv("DISCORD_TRANSCRIBE_CHANNEL_ID")
-    if channelID == None:
-        print("Please specify the CHANNEL ID of the voice channel in the DISCORD_TRANSCRIBE_CHANNEL_ID environment variable")
-        return
-    channel = guild.get_channel(int(channelID))
-    if not isinstance(channel, discord.VoiceChannel):
-        print(f"Could not connect to voice channel with ID {channelID} in guild with ID {guildID}")
-        return
+        # connect to VC and check DAVE connection
+        voice = ctx.author.voice
+        if not voice:
+            await ctx.send("Not in voice channel!")
+            return
 
-    # connect to VC and check DAVE connection
-    # TODO: current issue: does not receive user audio when there are users already in the call
-    vc = await channel.connect()
-    if vc == None:
-        print("Could not connect to VC")
-        return
-    if not vc.is_dave_connection():
-        print("Could not get the DAVE connection setup")
-        return
-    print(f"Successfully connect to channel with ID {channelID} in guild with ID {guildID}")
-    print("Press Ctrl-C to disconenct")
+        print("Joining voice channel, please wait...")
+        vc = await voice.channel.connect()
+        if vc == None:
+            print("Could not connect to VC")
+            return
+        if not vc.is_dave_connection():
+            print("Could not get the DAVE connection setup")
+            return
 
-    # listen to users and transcribe
-    recognizers = {}
-    is_transcribing = mp.Value('i', 1)
-    vc.start_recording(VoskSink(vosk_model, is_transcribing, recognizers))
-    print("Transcriber has started")
+        # start listening and transcribing
+        vc.start_recording(VoskSink(vosk_model, is_transcribing, recognizers))
+        await ctx.send("Transcriber has started")
+        cur_vc = vc
 
+    @bot.command()
+    async def leave(ctx):
+        global is_transcribing, recognizers, cur_vc
+
+        is_transcribing.value = 0
+        is_transcribing.value = 1
+
+        if cur_vc: await cur_vc.disconnect()
 
     try:
         # wait for shutdown response
@@ -161,7 +162,9 @@ async def main():
     except asyncio.CancelledError:
         # cleanup when shutting down
         is_transcribing.value = 0
-        await vc.disconnect()
+        if cur_vc:
+            cur_vc.stop_recording
+            await cur_vc.disconnect()
 
 
 if __name__ == "__main__":
