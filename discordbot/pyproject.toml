@@ -1,0 +1,18 @@
+[project]
+name = "discordbot"
+version = "0.1.0"
+description = "The Discord integration for berry, including Speech to Text and Speech to Text"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "davey>=0.1.6",
+    "pocket-tts>=3.0.2",
+    "py-cord[voice]",
+    "vosk>=0.3.45",
+]
+
+[tool.uv.sources]
+py-cord = { git = "https://github.com/Pycord-Development/pycord", rev = "refs/pull/3159/head" }
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cpu"
