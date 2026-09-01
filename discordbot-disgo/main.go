@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/signal"
@@ -15,12 +17,16 @@ import (
 	"github.com/disgoorg/disgo/voice"
 	"github.com/disgoorg/godave/golibdave"
 	"github.com/disgoorg/snowflake/v2"
+
+	vosk "github.com/alphacep/vosk-api/go"
+	"gopkg.in/hraban/opus.v2"
 )
 
 var (
 	token          = os.Getenv("DISCORD_TOKEN")
 	transGuildID   = snowflake.GetEnv("TRANSCRIBE_GUILD_ID")
 	transChannelID = snowflake.GetEnv("TRANSCRIBE_CHANNEL_ID")
+	voskModelPath  = os.Getenv("VOSK_MODEL_PATH")
 )
 
 func main() {
@@ -53,6 +59,16 @@ func main() {
 }
 
 func joinVC(client *bot.Client) {
+	fmt.Println("Joining VC, please wait...")
+
+	// create the Vosk transcriber
+	fmt.Println("Loading Vosk model...")
+	voskModel, err := vosk.NewModel(voskModelPath)
+	if err != nil {
+		fmt.Println("Could not load vosk model")
+		panic(err)
+	}
+
 	// setup the voice connection
 	conn := client.VoiceManager.CreateConn(transGuildID)
 	if conn == nil {
@@ -70,7 +86,7 @@ func joinVC(client *bot.Client) {
 
 	// setup receiver
 	opusReceiverChannel := make(chan OpusPacket, 512)
-	go OpusPacketHandler(opusReceiverChannel)
+	go OpusPacketHandler(opusReceiverChannel, voskModel)
 	opusReceiver := &OpusReceiver{opusReceiverChannel}
 	conn.SetOpusFrameReceiver(opusReceiver)
 }
@@ -87,13 +103,13 @@ type OpusCapture struct {
 	free       bool
 	userID     snowflake.ID
 	timestamp  int64
-	opus       []byte
+	opus       [][]byte
 }
 
-func OpusPacketHandler(c chan OpusPacket) {
+func OpusPacketHandler(c chan OpusPacket, voskModel *vosk.VoskModel) {
 	captures := [512]*OpusCapture{}
 	for i := range captures {
-		captures[i] = &OpusCapture{false, false, true, 0, 0, []byte{}}
+		captures[i] = &OpusCapture{false, false, true, 0, 0, [][]byte{}}
 	}
 
 	for {
@@ -120,7 +136,7 @@ func OpusPacketHandler(c chan OpusPacket) {
 						continue
 					}
 
-					captures[i] = &OpusCapture{false, false, false, opusPacket.userID, opusPacket.timestamp, []byte{}}
+					captures[i] = &OpusCapture{false, false, false, opusPacket.userID, opusPacket.timestamp, [][]byte{}}
 					captureIdx = i
 					break
 				}
@@ -128,7 +144,7 @@ func OpusPacketHandler(c chan OpusPacket) {
 
 			capture := captures[captureIdx]
 			capture.timestamp = opusPacket.timestamp
-			capture.opus = append(capture.opus, opusPacket.opus...)
+			capture.opus = append(capture.opus, opusPacket.opus)
 		default: // just don't do the above block if nothing comes through the channel
 		}
 
@@ -138,7 +154,7 @@ func OpusPacketHandler(c chan OpusPacket) {
 			if capture.dead == false {
 				continue
 			}
-			captures[i] = &OpusCapture{false, false, true, 0, 0, []byte{}}
+			captures[i] = &OpusCapture{false, false, true, 0, 0, [][]byte{}}
 		}
 
 		// transcribe the completed captures
@@ -150,7 +166,47 @@ func OpusPacketHandler(c chan OpusPacket) {
 
 			capture.processing = true
 			go func() {
-				fmt.Println("Finished processing capture for", capture.userID, "at index", i)
+				// mark capture as being processes
+
+				// setup the recognizer
+				rec, err := vosk.NewRecognizer(voskModel, 16000.0)
+				if err != nil {
+					fmt.Println("Could not start Vosk transcriber")
+					panic(err)
+				}
+
+				// convert the raw opus into 1 channel, 16000 kHz pcm
+				decoder, err := opus.NewDecoder(16000, 1)
+				if err != nil {
+					fmt.Println("Could not create audio decoder")
+					panic(err)
+				}
+				for _, packet := range capture.opus {
+					frame := make([]int16, 1920)
+					n, err := decoder.Decode(packet, frame)
+					if err != nil {
+						fmt.Println("Error decoding audio")
+						fmt.Println("error:", err)
+						return
+					}
+
+					pcmBytes := make([]byte, n*2)
+					for i := range n {
+						pcmFrame := make([]byte, 2)
+						binary.LittleEndian.PutUint16(pcmFrame, uint16(frame[i]))
+						pcmBytes = append(pcmBytes, pcmFrame...)
+					}
+
+					rec.AcceptWaveform(pcmBytes)
+				}
+
+				// do the transcription
+				fmt.Println("Getting transcription in index", i)
+				var result map[string]interface{}
+				json.Unmarshal([]byte(rec.FinalResult()), result)
+				fmt.Println(capture.userID, ":", result)
+
+				// mark capture for reuse
 				capture.dead = true
 			}()
 		}
