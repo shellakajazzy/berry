@@ -1,17 +1,4 @@
-[![Entangled badge](https://img.shields.io/badge/entangled-Use%20the%20source!-%2300aeff)](https://entangled.github.io/)
-
-# berry
-A system of AI systems made to entertain, in the vein of [Neuro-sama](https://vedal.ai/). (Go support Vedal!)
-
-## Sloat Integration
-I am using [Sloat](https://stoat.chat/) as the main way for me and my friends to communicate with b"rry.
-
-I chose Sloat over [Discord](https://discord.com/) due to running into issues over voice reception and [DAVE](https://discord.com/blog/meet-dave-e2ee-for-audio-video), as well as the fact that a Discord bot would be unable to send and receive video.
-
-Additionally, I want the option to self host Sloat in the future, in case I run into issues regarding Discord.
-
-[`sloatbot.py`](./sloatbot.py):
-```{.python file=sloatbot.py}
+# ~/~ begin <<README.md#sloatbot.py>>[init]
 # /// script
 # dependencies = [
 #   "stoat.py[voice,speed]",
@@ -117,4 +104,4 @@ async def on_ready(event, /):
     print(f"Logged in as {event.me.tag}")
 
 client.run(os.environ["STOAT_TOKEN"])
-```
+# ~/~ end
