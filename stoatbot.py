@@ -1,4 +1,4 @@
-# ~/~ begin <<README.md#sloatbot.py>>[init]
+# ~/~ begin <<README.md#stoatbot.py>>[init]
 # /// script
 # dependencies = [
 #   "stoat.py[voice,speed]",
@@ -12,24 +12,29 @@ import stoat
 import wave
 
 client = stoat.Client()
-room = None
 tasks = []
-
+# ~/~ begin <<README.md#stoat_globals>>[init]
+room = None
+# ~/~ end
+# ~/~ begin <<README.md#stoat_globals>>[1]
+tasks = []
+# ~/~ end
 
 # setup commands
 @client.on(stoat.MessageCreateEvent)
 async def on_message(event, /):
     global room, tasks
-
     message = event.message
     if message.author.relationship is stoat.RelationshipStatus.user: return
 
     # join command
     if message.content == "$berryjoin":
+        # ~/~ begin <<README.md#stoat_join_vc>>[init]
         if room != None:
             await message.channel.send("b\"rry is already in a voice channel")
             return
-
+        # ~/~ end
+        # ~/~ begin <<README.md#stoat_join_vc>>[1]
         voice_states = client.voice_states
         voice_channel_id = None
         for channel_id, voice_channel in voice_states.items():
@@ -39,14 +44,17 @@ async def on_message(event, /):
         if voice_channel_id == None:
             await message.channel.send("You are not in a voice channel")
             return
-
+        # ~/~ end
+        # ~/~ begin <<README.md#stoat_join_vc>>[2]
         voice_channel = client.get_channel(voice_channel_id)
         room = await voice_channel.connect()
-
+        # ~/~ end
+        # ~/~ begin <<README.md#stoat_voice_receive>>[init]
+        # ~/~ begin <<README.md#stoat_voice_recv_handle_audio>>[init]
         # manage what happens when audio packet is received
         async def handle_audio(track, participant):
             print("Subscribed to user:", participant)
-
+        
             audio_stream = rtc.AudioStream(track)
             wav_file = None
             try:
@@ -59,49 +67,52 @@ async def on_message(event, /):
                         wav_file.setsampwidth(2)
                         wav_file.setframerate(frame.sample_rate)
                     wav_file.writeframes(frame.data)
-
+        
             # close the stream
             except asyncio.CancelledError: pass
             finally:
                 if wav_file: wav_file.close()
                 await audio_stream.aclose()
-
-        # subscribe to the user tasks
-        ## for users already in the voice channel
-        @room.on("track_subscribed")
-        def on_track_subscribe(track, publication, participant):
-            if track.kind == rtc.TrackKind.KIND_AUDIO:
-                task = asyncio.create_task(handle_audio(track, participant))
-                tasks.append(task)
-        ## for users that will join the voice channel
+        # ~/~ end
+        # ~/~ begin <<README.md#stoat_voice_recv_sub_to_users>>[init]
+        # for users that are already in the voice channel
         for participant in room.remote_participants.values():
             for pub in participant.track_publications.values():
                 if pub.track and pub.kind == rtc.TrackKind.KIND_AUDIO:
                     task = asyncio.create_task(handle_audio(pub.track, participent))
                     tasks.append(task)
-
+        # ~/~ end
+        # ~/~ begin <<README.md#stoat_voice_recv_sub_to_users>>[1]
+        # for users that will join the voice channel
+        @room.on("track_subscribed")
+        def on_track_subscribe(track, publication, participant):
+            if track.kind == rtc.TrackKind.KIND_AUDIO:
+                task = asyncio.create_task(handle_audio(track, participant))
+                tasks.append(task)
+        # ~/~ end
+        # ~/~ end
         await message.channel.send("b\"rry has joined the voice channel")
         print(room)
 
     # leave command
     elif message.content == "$berryleave":
+        # ~/~ begin <<README.md#stoat_dc_cleanup>>[init]
+        for task in tasks: task.cancel()
+        tasks = []
+        # ~/~ end
+        # ~/~ begin <<README.md#stoat_leave_vc>>[init]
         if room == None:
             await message.channel.send("b\"rry is not in a voice channel to leave")
             return
-
-        for task in tasks: task.cancel()
-        tasks = []
-
+        # ~/~ end
+        # ~/~ begin <<README.md#stoat_leave_vc>>[1]
         await room.disconnect()
         room = None
-
         await message.channel.send("b\"rry has left the voice channel")
-
+        # ~/~ end
 
 # run the bot
 @client.on(stoat.ReadyEvent)
-async def on_ready(event, /):
-    print(f"Logged in as {event.me.tag}")
-
+async def on_ready(event, /): print(f"Logged in as {event.me.tag}")
 client.run(os.environ["STOAT_TOKEN"])
 # ~/~ end
