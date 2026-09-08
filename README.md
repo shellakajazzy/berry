@@ -3,12 +3,12 @@
 # berry
 A system of AI systems made to entertain, in the vein of [Neuro-sama](https://vedal.ai/). (Go support Vedal!)
 
-## Sloat Integration
-I am using [Sloat](https://stoat.chat/) as the main way for me and my friends to communicate with b"rry.
+## Stoat Integration
+I am using [Stoat](https://stoat.chat/) as the main way for me and my friends to communicate with b"rry.
 
-I chose Sloat over [Discord](https://discord.com/) due to running into issues over voice reception and [DAVE](https://discord.com/blog/meet-dave-e2ee-for-audio-video), as well as the fact that a Discord bot would be unable to send and receive video.
+I chose Stoat over [Discord](https://discord.com/) due to running into issues over voice reception and [DAVE](https://discord.com/blog/meet-dave-e2ee-for-audio-video), as well as the fact that a Discord bot would be unable to send and receive video.
 
-Additionally, I want the option to self host Sloat in the future, in case I run into issues regarding Discord.
+Additionally, I want the option to self host Stoat in the future, in case I run into issues regarding Discord.
 
 [`stoatbot.py`](./stoatbot.py):
 ```{.python file=stoatbot.py}
@@ -54,9 +54,9 @@ client.run(os.environ["STOAT_TOKEN"])
 ```
 
 ### Join Voice Channel
-Sloat uses [LiveKit](https://docs.livekit.io/reference/python/livekit/rtc/index.html) to handle voice and video connections.
+Stoat uses [LiveKit](https://docs.livekit.io/reference/python/livekit/rtc/index.html) to handle voice and video connections.
 
-I am planning to have b"rry be able to only join 1 LiveKit Room in Sloat.
+I am planning to have b"rry be able to only join 1 LiveKit Room in Stoat.
 Thus, we need to ensure that the `room` global is `None` before attempting to connect to a VC.
 
 `stoat_globals`:
