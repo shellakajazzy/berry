@@ -1,13 +1,16 @@
 # ~/~ begin <<README.md#stoatbot.py>>[init]
 # /// script
 # dependencies = [
+#   "requests",
 #   "stoat.py[voice,speed]",
 # ]
 # ///
 
 import asyncio
+import base64
 from livekit import rtc
 import os
+import requests
 import stoat
 import wave
 
@@ -61,25 +64,33 @@ async def on_message(event, /):
                 # receives packets even during silence, which is nice
                 async for event in audio_stream:
                     frame = event.frame
-                    if wav_file is None:
-                        wav_file = wave.open(str(participant.identity), "wb")
-                        wav_file.setnchannels(frame.num_channels)
-                        wav_file.setsampwidth(2)
-                        wav_file.setframerate(frame.sample_rate)
-                    wav_file.writeframes(frame.data)
+                    data = {
+                        "from": "stoat",
+                        "userid": participant.identity,
+                        "username": participant.name,
+                        "channels": frame.num_channels,
+                        "framerate": frame.sample_rate,
+                        "data": base64.b64encode(bytes(frame.data)).decode("utf-8")
+                    }
+                    try: requests.post("http://localhost:8000", json=data)
+                    except: pass
         
             # close the stream
             except asyncio.CancelledError: pass
-            finally:
-                if wav_file: wav_file.close()
-                await audio_stream.aclose()
+            finally: await audio_stream.aclose()
         # ~/~ end
         # ~/~ begin <<README.md#stoat_voice_recv_sub_to_users>>[init]
         # for users that are already in the voice channel
         for participant in room.remote_participants.values():
             for pub in participant.track_publications.values():
                 if pub.track and pub.kind == rtc.TrackKind.KIND_AUDIO:
-                    task = asyncio.create_task(handle_audio(pub.track, participent))
+                    data = {
+                        "from": "stoat",
+                        "register": participant.identity,
+                    }
+                    try: requests.post("http://localhost:8000", json=data)
+                    except: pass
+                    task = asyncio.create_task(handle_audio(pub.track, participant))
                     tasks.append(task)
         # ~/~ end
         # ~/~ begin <<README.md#stoat_voice_recv_sub_to_users>>[1]
@@ -87,6 +98,12 @@ async def on_message(event, /):
         @room.on("track_subscribed")
         def on_track_subscribe(track, publication, participant):
             if track.kind == rtc.TrackKind.KIND_AUDIO:
+                data = {
+                    "from": "stoat",
+                    "register": participant.identity,
+                }
+                try: requests.post("http://localhost:8000", json=data)
+                except: pass
                 task = asyncio.create_task(handle_audio(track, participant))
                 tasks.append(task)
         # ~/~ end
