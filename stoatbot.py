@@ -15,6 +15,7 @@ import stoat
 import wave
 
 client = stoat.Client()
+stt_url = f"http://{os.environ["STT_IP"]}:{os.environ["STT_PORT"]}"
 tasks = []
 # ~/~ begin <<README.md#stoat_globals>>[init]
 room = None
@@ -72,7 +73,7 @@ async def on_message(event, /):
                         "framerate": frame.sample_rate,
                         "data": base64.b64encode(bytes(frame.data)).decode("utf-8")
                     }
-                    try: requests.post("http://localhost:8000", json=data)
+                    try: requests.post(stt_url, json=data)
                     except: pass
         
             # close the stream
@@ -88,7 +89,7 @@ async def on_message(event, /):
                         "from": "stoat",
                         "register": participant.identity,
                     }
-                    try: requests.post("http://localhost:8000", json=data)
+                    try: requests.post(stt_url, json=data)
                     except: pass
                     task = asyncio.create_task(handle_audio(pub.track, participant))
                     tasks.append(task)
@@ -102,7 +103,7 @@ async def on_message(event, /):
                     "from": "stoat",
                     "register": participant.identity,
                 }
-                try: requests.post("http://localhost:8000", json=data)
+                try: requests.post(stt_url, json=data)
                 except: pass
                 task = asyncio.create_task(handle_audio(track, participant))
                 tasks.append(task)

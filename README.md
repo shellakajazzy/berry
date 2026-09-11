@@ -28,6 +28,7 @@ import stoat
 import wave
 
 client = stoat.Client()
+stt_url = f"http://{os.environ["STT_IP"]}:{os.environ["STT_PORT"]}"
 tasks = []
 <<stoat_globals>>
 
@@ -143,7 +144,7 @@ for participant in room.remote_participants.values():
                 "from": "stoat",
                 "register": participant.identity,
             }
-            try: requests.post("http://localhost:8000", json=data)
+            try: requests.post(stt_url, json=data)
             except: pass
             task = asyncio.create_task(handle_audio(pub.track, participant))
             tasks.append(task)
@@ -161,7 +162,7 @@ def on_track_subscribe(track, publication, participant):
             "from": "stoat",
             "register": participant.identity,
         }
-        try: requests.post("http://localhost:8000", json=data)
+        try: requests.post(stt_url, json=data)
         except: pass
         task = asyncio.create_task(handle_audio(track, participant))
         tasks.append(task)
@@ -206,7 +207,7 @@ async def handle_audio(track, participant):
                 "framerate": frame.sample_rate,
                 "data": base64.b64encode(bytes(frame.data)).decode("utf-8")
             }
-            try: requests.post("http://localhost:8000", json=data)
+            try: requests.post(stt_url, json=data)
             except: pass
 
     # close the stream
@@ -216,6 +217,7 @@ async def handle_audio(track, participant):
 
 ## Speech to Text
 Speech to text is handled through [Moonshine Voice](https://moonshine-voice.readthedocs.io/en/latest/).
+This program is an HTTP server that accepts audio encoded into JSON and runs them through a Moonshine transcriber stream.
 
 [`stt.py`](stt.py):
 ``` {.python file=stt.py}
@@ -231,86 +233,30 @@ import http.server as server
 import json
 import moonshine_voice as msv
 import numpy as np
+import os
+
 
 streams = {}
-model_path, model_arch = msv.get_model_for_language("en", msv.ModelArch.MEDIUM_STREAMING)
-transcriber = msv.Transcriber(model_path=model_path, model_arch=model_arch)
+server_ip = os.environ["STT_IP"]
+server_port = os.environ["STT_PORT"]
+<<stt_moonshine_setup>>
 
-class StoatListener(msv.TranscriptEventListener):
-    def register_user(self, userid):
-        self.userid = userid
-        print(f"Registered userid {userid} to StoatListener")
 
-    def on_line_started(self, event): pass
-
-    def on_line_text_changed(self, event): pass
-
-    def on_line_completed(self, event):
-        print(f"{streams[self.userid]["username"]}: {event.line.text}")
-
+# setup server handler
 class STTHandler(server.BaseHTTPRequestHandler):
-    def log_message(self, format, *args):
-        if args and str(args[-1]) not in ("200", "304"):
-            super().log_message(format, *args)
-    def log_request(self, code='-', size='-'): pass
-
-    def build_send_response(self, code, response_json):
-        response_bytes = json.dumps(response_json).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(response_bytes)))
-        self.end_headers()
-        self.wfile.write(response_bytes)
-
+    <<stt_http_helpers>>
     def do_POST(self):
         try:
+            # get request contents
             content_length = int(self.headers.get("Content-Length", 0))
             body = self.rfile.read(content_length)
             data = json.loads(body)
 
             if "from" not in data or data["from"] not in ["stoat"]: raise Exception("From field not found")
             if data["from"] == "stoat":
-                # register user if register command is given
-                if "register" in data and type(data["register"]) == str and data["register"] not in streams:
-                    print(f"Registering user {data["register"]}")
-
-                    streams[data["register"]] = {}
-                    streams[data["register"]]["ready"] = False
-                    streams[data["register"]]["stream"] = transcriber.create_stream(update_interval=0.1)
-                    streams[data["register"]]["listener"] = StoatListener()
-
-                    streams[data["register"]]["listener"].register_user(data["register"])
-                    streams[data["register"]]["stream"].add_listener(streams[data["register"]]["listener"])
-                    streams[data["register"]]["stream"].start()
-
-                    streams[data["register"]]["ready"] = True
-                    print(f"User {data["register"]} registered in streams")
-                    self.build_send_response(200, {"success": True})
-                    return
-
-                # check if user is already registered in streams
-                if "userid" not in data or type(data["userid"]) != str: Exception("No userid (string) provided")
-                if data["userid"] not in streams or streams[data["userid"]]["ready"] != True:
-                    self.build_send_response(200, {"success": True})
-                    return
-
-                # check for necessary fields
-                if "username" not in data or type(data["username"]) != str: Exception("No username (string) provided")
-                if "username" not in streams[data["userid"]]: streams[data["userid"]]["username"] = data["username"]
-                if "channels" not in data or type(data["channels"]) != int: Exception("No channels (int) provided")
-                # TODO: do something if channels is not mono
-                if "framerate" not in data or type(data["framerate"]) != int: Exception("No framerate (int) provided")
-                if "data" not in data or type(data["data"]) != str: Exception("No data (string) provided")
-
-                # decode audio frame from base64
-                audio_frame = None
-                try: audio_frame = bytes(base64.b64decode(data["data"]))
-                except Exception as e: raise e
-                samples = np.frombuffer(audio_frame, dtype=np.int16)
-                samples = samples.astype(np.float32) / 32768.0
-
-                # add audio to stream
-                streams[data["userid"]]["stream"].add_audio(audio_data=samples, sample_rate=data["framerate"])
+                <<stt_stoat_reg_user>>
+                <<stt_stoat_data_checks>>
+                <<stt_stoat_process_audio>>
 
             self.build_send_response(200, {"success": True})
             return
@@ -319,11 +265,137 @@ class STTHandler(server.BaseHTTPRequestHandler):
             self.build_send_response(400, {"success": False, "error": str(e)})
             return
 
+
+# run the server
 def main():
-    with server.HTTPServer(("localhost", 8000), STTHandler) as stt_server:
+    with server.HTTPServer((server_ip, int(server_port)), STTHandler) as stt_server:
         print("STT server started")
         stt_server.serve_forever()
+if __name__ == "__main__": main()
+```
 
-if __name__ == "__main__":
-    main()
+### Moonshine Setup
+
+`stt_moonshine_setup`:
+``` {.python #stt_moonshine_setup}
+model_path, model_arch = msv.get_model_for_language("en", msv.ModelArch.MEDIUM_STREAMING)
+transcriber = msv.Transcriber(model_path=model_path, model_arch=model_arch)
+```
+
+`stt_moonshine_setup`:
+``` {.python #stt_moonshine_setup}
+class LineListener(msv.TranscriptEventListener):
+    def register_user(self, userid):
+        self.userid = userid
+        print(f"Registered userid {userid} to LineListener")
+    def on_line_started(self, event): pass
+    def on_line_text_changed(self, event): pass
+
+    def on_line_completed(self, event):
+        print(f"{streams[self.userid]["username"]}: {event.line.text}")
+```
+
+### HTTP Server Helpers
+Here are some helper methods to make the output of the 
+
+If we print out all logs from the server, even if they are a successes, the console gets crowded and it becomes harder to catch when other events happen that are logged through printing to the console.
+
+`stt_http_helpers`:
+``` {.python #stt_http_helpers}
+# suppress non-error messages
+def log_message(self, format, *args):
+    if args and str(args[-1]) not in ("200"): super().log_message(format, *args)
+def log_request(self, code='-', size='-'): pass
+```
+
+This method is simply a helper to make it easier to build responses to requests.
+
+`stt_http_helpers`:
+``` {.python #stt_http_helpers}
+# make JSON responses easy
+def build_send_response(self, code, response_json):
+    response_bytes = json.dumps(response_json).encode("utf-8")
+    self.send_response(code)
+    self.send_header("Content-Type", "application/json")
+    self.send_header("Content-Length", str(len(response_bytes)))
+    self.end_headers()
+    self.wfile.write(response_bytes)
+```
+
+
+### Stoat
+For now, Stoat is the only integration for this server.
+From the Stoat bot, the data that can be parsed in the STT server are:
+- `register`: Contains the `userid` of the user to register a Moonshine stream for
+  - If it is provided, it will register the user and continue to the next request
+- `userid`: The ID of the user whose audio data is being provided
+- `username`: The name of the user whose audio data is being provided
+- `channels`: How many audio channels the audio data has
+- `framerate`: The sample rate of the audio data
+- `data`: The bytes of the `int16` audio data provided by LiveKit RTC encoded as base64
+  - Needs to be decoded and transformed into a float32 from [-1.0, 1.0] in order to be processed by Moonshine
+
+#### Register New User
+Handles the `register` field, if provided in the JSON body.
+
+`stt_stoat_reg_user`:
+``` {.python #stt_stoat_reg_user}
+# register user if register command is given
+if "register" in data and type(data["register"]) == str and data["register"] not in streams:
+    print(f"Registering user {data["register"]}")
+
+    streams[data["register"]] = {}
+    streams[data["register"]]["ready"] = False
+    streams[data["register"]]["stream"] = transcriber.create_stream(update_interval=0.1)
+    streams[data["register"]]["listener"] = LineListener()
+
+    streams[data["register"]]["listener"].register_user(data["register"])
+    streams[data["register"]]["stream"].add_listener(streams[data["register"]]["listener"])
+    streams[data["register"]]["stream"].start()
+
+    streams[data["register"]]["ready"] = True
+    print(f"User {data["register"]} registered in streams")
+    self.build_send_response(200, {"success": True})
+    return
+```
+
+#### JSON Data Checks
+First, we need to ensure `userid` is in the `streams` dictionary, in which case the program can receive.
+
+`stt_stoat_data_checks`:
+``` {.python #stt_stoat_data_checks}
+# check if user is already registered in streams
+if "userid" not in data or type(data["userid"]) != str: Exception("No userid (string) provided")
+if data["userid"] not in streams or streams[data["userid"]]["ready"] != True:
+    self.build_send_response(200, {"success": True})
+    return
+```
+
+Once it is confirmed that the `userid` field exists, we can proceed to checking for the other necessary data for Stoat.
+
+`stt_stoat_data_checks`:
+``` {.python #stt_stoat_data_checks}
+# check for necessary fields
+if "username" not in data or type(data["username"]) != str: Exception("No username (string) provided")
+if "username" not in streams[data["userid"]]: streams[data["userid"]]["username"] = data["username"]
+if "channels" not in data or type(data["channels"]) != int: Exception("No channels (int) provided")
+# TODO: do something if channels is not mono
+if "framerate" not in data or type(data["framerate"]) != int: Exception("No framerate (int) provided")
+if "data" not in data or type(data["data"]) != str: Exception("No data (string) provided")
+```
+
+#### Process Audio
+The audio data needs to be decoded from base64 and turned into a float from [-1.0, 1.0], in which case we use NumPy.
+
+`stt_stoat_process_audio`:
+``` {.python #stt_stoat_process_audio}
+# decode audio frame from base64
+audio_frame = None
+try: audio_frame = bytes(base64.b64decode(data["data"]))
+except Exception as e: raise e
+samples = np.frombuffer(audio_frame, dtype=np.int16)
+samples = samples.astype(np.float32) / 32768.0
+
+# add audio to stream
+streams[data["userid"]]["stream"].add_audio(audio_data=samples, sample_rate=data["framerate"])
 ```
