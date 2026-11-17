@@ -1,7 +1,6 @@
 # /// script
 # dependencies = [
 #   "davey>=0.1.6",
-#   "moonshine-voice",
 #   "numpy",
 #   "py-cord[voice]",
 # ]
@@ -20,31 +19,11 @@ import discord
 from discord.ext import commands
 from discord.sinks import Sink
 
-# voice transcription / generation
-import moonshine_voice as msv
-import numpy as np
-
 
 bot = None
 
 
 async def main(token):
-    # listener for moonshine
-    class LineListener(msv.TranscriptEventListener):
-        def register_username(self, username):
-            self.username = username
-            print(f"Registered username {username} to LineListener")
-
-        def on_line_started(self, event): pass
-        def on_line_text_changed(self, event): pass
-        def on_line_completed(self, event):
-            print(f"{self.username}: {event.line.text}")
-
-    # load moonshine for voice transcription
-    moonshine_streams = {}
-    model_path, model_arch = msv.get_model_for_language("en", msv.ModelArch.MEDIUM_STREAMING)
-    transcriber = msv.Transcriber(model_path=model_path, model_arch=model_arch)
-
     # setup bot with intents
     intents = discord.Intents.default()
     intents.message_content = True
@@ -57,41 +36,20 @@ async def main(token):
     
         def write(self, data, user) -> None:
             if user is None or getattr(user, "bot", False): return
-    
+
+            # TODO: implement sending audio to the Neuro API server
             userid = user.id
-            if userid not in moonshine_streams:
-                moonshine_streams[userid] = {}
-                stream = moonshine_streams[userid]
-                stream["username"] = user.display_name
-                stream["stream"] = transcriber.create_stream(update_interval=0.1)
-                stream["listener"] = LineListener()
-                stream["listener"].register_username(user.name)
-                stream["stream"].add_listener(stream["listener"])
-                stream["stream"].start()
-                print(f"Transcriber for {user.name} started")
-
-            stream = moonshine_streams[userid]
-
             pcm = data.pcm
             if not pcm: return
-
-            samples = np.frombuffer(pcm, dtype=np.int16)
-            samples = samples[::2]
-            samples = samples.astype(np.float32) / 32768.0
-
-            try:
-                stream["stream"].add_audio(samples, 48000)
-            except Exception as e:
-                print(str(e))
 
     # have bot connect to VC on startup and start listening using the sink
     @bot.event
     async def on_ready() -> None:
         print(f"Logged in as {bot.user}")
     
-        guild_id = os.getenv("TRANSCRIBE_GUILD_ID")
+        guild_id = os.getenv("DISCORD_GUILD_ID")
         if not token: raise SystemExit("TRANSCRIBE_GUILD_ID environment variable not found")
-        channel_id = os.getenv("TRANSCRIBE_CHANNEL_ID")
+        channel_id = os.getenv("DISCORD_CHANNEL_ID")
         if not token: raise SystemExit("TRANSCRIBE_CHANNEL_ID environment variable not found")
     
         print("Joining channel...")
