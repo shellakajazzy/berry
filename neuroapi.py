@@ -1,5 +1,6 @@
 # /// script
 # dependencies = [
+#   "httpx",
 #   "pydantic",
 #   "websockets"
 # ]
@@ -9,7 +10,9 @@
 import config
 
 import asyncio
+import copy
 import http
+import httpx
 import json
 import pydantic
 import signal
@@ -176,8 +179,19 @@ async def handler(websocket):
                     except: continue
 
                     for speaker in data["speakers"]:
-                        VOICE_ROUTES[f"/game/{game}/voice"]["speakers"][speaker["id"]] = speaker["name"]
-                        print(f"Registered speaker with id {speaker["id"]} and name {speaker["name"]}")
+                        if speaker["id"] in VOICE_ROUTES[f"/game/{game}/voice"]["speakers"]:
+                            async with VOICE_ROUTES[f"/game/{game}/voice"]["speakers"][speaker["id"]]["lock"]:
+                                if VOICE_ROUTES[f"/game/{game}/voice"]["speakers"][speaker["id"]]["name"] != speaker["name"]:
+                                    VOICE_ROUTES[f"/game/{game}/voice"]["speakers"][speaker["id"]]["name"] = speaker["name"]
+                                    print(f"Updated name of id {speaker["id"]} with name {speaker["name"]}")
+                        else:
+                            VOICE_ROUTES[f"/game/{game}/voice"]["speakers"][speaker["id"]] = {
+                                "lock": asyncio.Lock(),
+                                "name": speaker["name"],
+                                "timestamp": None,
+                                "segment": b""
+                            }
+                            print(f"Registered speaker with id {speaker["id"]} and name {speaker["name"]}")
                 case "voice/speakers/unregister":
                     # deletes speakers by their ID
 
@@ -192,22 +206,76 @@ async def handler(websocket):
 
 
 # handler for voice receive (speech to text)
+async def stt_processor():
+    global VOICE_ROUTES
+
+    print("Started speech to text processor")
+    while True:
+        for _, route in VOICE_ROUTES.items():
+            for speaker_id, speaker in route["speakers"].items():
+                # create a copy of the speaker segment and info so that the buffer can be cleared
+                # for more streamed in audio packets
+                speaker_copy = {"id": speaker_id}
+                async with speaker["lock"]:
+                    timestamp = round(time.time() * 1000)
+                    if (speaker["timestamp"] == None or
+                        speaker["timestamp"] + config.VOICE_THRESHOLD_MS > timestamp):
+                        continue
+
+                    speaker_copy["name"] = copy.deepcopy(speaker["name"])
+                    speaker_copy["segment"] = copy.deepcopy(speaker["segment"])
+
+                    speaker["timestamp"] = None
+                    speaker["segment"] = b""
+
+                # convert from 48 kHz mono PCM to something acceptable by whisper.cpp
+                proc = await asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-f", "f32le", "-ar", "48000", "-ac", "1", "-i", "pipe:0",
+                    "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+                    "-f", "wav", "pipe:1",
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                )
+                wav_bytes, err = await proc.communicate(input=bytes(speaker_copy["segment"]))
+                if proc.returncode != 0:
+                    print(f"ffmpeg failed: {err.decode()}")
+                    continue
+
+                async with httpx.AsyncClient() as http_client:
+                    res = await http_client.post(
+                        f"http://{config.WHISPER_IP}:{config.WHISPER_PORT}/inference",
+                        files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+                        data={"temperature": "0.0", "response_formate": "json"},
+                        timeout=60.0
+                    )
+                    transcription = res.json()["text"][1:-1]
+                    print(f"{speaker_copy["name"]} ({speaker_copy["id"]}): {transcription}")
+
+        await asyncio.sleep(0.01)
+
 async def voice_recv_handler(websocket):
     global CLIENTS, ACTIONS, VOICE_ROUTES
 
+    voice_route = VOICE_ROUTES[websocket.request.path]
     VOICE_ROUTES[websocket.request.path]["clients"].add(websocket)
     print(f"{id(websocket)} connected to core {websocket.request.path}")
 
+
     async for message in websocket:
-        msg_bytes = message.decode("utf-8")
-
-
-        speaker_id = int.from_bytes(msg_bytes[2:4], byteorder="little", signed=False)
-        pcm_sample = struct.unpack("<f", msg_bytes[4:])[0]
         timestamp = round(time.time() * 1000)
+        speaker_id = int.from_bytes(message[2:4], byteorder="little", signed=False)
 
-        # TODO: create ingestor for packets to turn into snippets that then turns into speech to text
+        if (speaker_id not in voice_route["speakers"] or
+            type(voice_route["speakers"][speaker_id]["lock"]) != asyncio.Lock):
+            continue
 
+        speaker = voice_route["speakers"][speaker_id]
+        async with speaker["lock"]:
+            speaker["timestamp"] = timestamp
+            speaker["segment"] += message[4:]
+            
 
 # run the server
 def process_request(connection, request):
@@ -219,6 +287,7 @@ async def main():
     stop = loop.create_future()
     loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
 
+    asyncio.create_task(stt_processor())
     async with websockets.serve(handler, "0.0.0.0", config.NEUROAPI_PORT, process_request=process_request):
         print(f"Server running on ws://0.0.0.0:{config.NEUROAPI_PORT}")
         await stop

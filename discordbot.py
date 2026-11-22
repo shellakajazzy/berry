@@ -14,6 +14,7 @@
 # python deps
 import asyncio
 import json
+import numpy
 import os
 import wave
 import websockets
@@ -57,8 +58,11 @@ async def main(token):
 
             pcm = data.pcm
             if not pcm: return
+            samples = numpy.frombuffer(pcm, dtype="<i2")
+            stereo = samples.reshape(-1, 2)
+            mono = stereo.astype(numpy.float32).mean(axis=1) / 32768.0
 
-            voice_payload = b""
+            voice_payload = b"\x01\x00" + self.uid_map[userid].to_bytes(2, "little") + mono.astype("<f4").tobytes()
             try:
                 # register user, easier to do it everytime so that everything is always up to date,
                 # and also registering shouldn't take too much time
