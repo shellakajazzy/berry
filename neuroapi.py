@@ -9,15 +9,17 @@
 import config
 
 import asyncio
+import http
 import json
 import pydantic
 import signal
+import struct
+import time
 import typing
 import websockets
 
 
-EVENTS = []       # ordered list of events that took place
-CLIENTS = ()      # list of ALL clients connected to the main websocket
+CLIENTS = set()   # list of ALL clients connected to the main websocket
 ACTIONS = {}      # contains actions for games and clients associated with games
 VOICE_ROUTES = {} # contains routes for voices, and the clients and speakers for a route
 
@@ -29,12 +31,12 @@ class Message(pydantic.BaseModel):
     data: typing.Optional[dict[str, typing.Any]] = None
 
 # "data" field validations
-UInt16 = Annotated[int, pydantic.Field(ge = 0, le = 65535)]
+UInt16 = typing.Annotated[int, pydantic.Field(ge = 0, le = 65535)]
 class Action(pydantic.BaseModel):
     class Schema(pydantic.BaseModel):
-        type: pydantic.Literal["object"]
-        model_config = ConfigDict(extra="allow")
-    model_config = ConfigDict(populate_by_name=True)
+        type: typing.Literal["object"]
+        model_config = pydantic.ConfigDict(extra="allow")
+    model_config = pydantic.ConfigDict(populate_by_name=True)
 
     name: str
     description: str
@@ -50,7 +52,7 @@ class ActionsForceData(pydantic.BaseModel):
     state: str | None = None
     query: str
     ephemeral_context: bool = False
-    priority: Literal["low", "medium", "high", "critical"] = "low"
+    priority: typing.Literal["low", "medium", "high", "critical"] = "low"
     silent: bool = False
     action_names: list[str] = pydantic.Field(min_length=1)
 class ActionsResultData(pydantic.BaseModel):
@@ -68,17 +70,18 @@ class VoiceSpeakersUnregisterData(pydantic.BaseModel):
 
 # handler for JSON websocket requests
 async def handler(websocket):
-    CLIENTS.add(websocket)
+    global CLIENTS, ACTIONS, VOICE_ROUTES
 
     # if this is for voice, pass it to the voice handler
     if websocket.request.path in VOICE_ROUTES:
         await voice_recv_handler(websocket)
         return
 
+    CLIENTS.add(websocket)
+    print(f"{id(websocket)} connected to core!")
+
     try:
         async for message in websocket:
-            await websocket.send(f"echo: {message}")
-            print(f"from: {id(websocket)}, msg: {message}")
 
             msg_json = None
             try:
@@ -87,12 +90,13 @@ async def handler(websocket):
             except: pass
 
             game = msg_json["game"]
-            data = msg_json["data"]
+            data = None
+            if "data" in msg_json: data = msg_json["data"]
             match msg_json["command"]:
                 case "startup":
                     # clear all actions for a game
                     ACTIONS[game] = {
-                            "clients": (),
+                            "clients": set(),
                             "actions": []
                     }
                     ACTIONS[game]["clients"].add(websocket)
@@ -150,16 +154,14 @@ async def handler(websocket):
                         }))
                         continue
 
-                    # create the route and add the client to it
+                    # create the route
                     VOICE_ROUTES = {}
                     if f"/game/{game}/voice" not in VOICE_ROUTES:
                         VOICE_ROUTES[f"/game/{game}/voice"] = {
-                            "clients": (),
+                            "clients": set(),
                             "speakers": {}
                         }
                         print(f"Added voice route for {game} at ws://0.0.0.0/game/{game}/voice")
-                    VOICE_ROUTES[f"/game/{game}/voice"]["clients"].add(websocket)
-                    print(f"Added client {} to voice route /game/{game}/voice")
                     await websocket.send(json.dumps({
                         "command": "voice/ready",
                         "data": {
@@ -191,19 +193,33 @@ async def handler(websocket):
 
 # handler for voice receive (speech to text)
 async def voice_recv_handler(websocket):
+    global CLIENTS, ACTIONS, VOICE_ROUTES
+
+    VOICE_ROUTES[websocket.request.path]["clients"].add(websocket)
+    print(f"{id(websocket)} connected to core {websocket.request.path}")
+
     async for message in websocket:
-        msg_bytes = message.encode("utf-8")
-        print(f"Received audio bytes {msg_bytes}")
-        # TODO: speech to text, add to events
+        msg_bytes = message.decode("utf-8")
+
+
+        speaker_id = int.from_bytes(msg_bytes[2:4], byteorder="little", signed=False)
+        pcm_sample = struct.unpack("<f", msg_bytes[4:])[0]
+        timestamp = round(time.time() * 1000)
+
+        # TODO: create ingestor for packets to turn into snippets that then turns into speech to text
 
 
 # run the server
+def process_request(connection, request):
+    if request.path in VOICE_ROUTES or request.path == "/": return None
+    return connection.respond(http.HTTPStatus.NOT_FOUND, "Unknown path\n")
+
 async def main():
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
     loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
 
-    async with websockets.serve(handler, "0.0.0.0", config.NEUROAPI_PORT):
+    async with websockets.serve(handler, "0.0.0.0", config.NEUROAPI_PORT, process_request=process_request):
         print(f"Server running on ws://0.0.0.0:{config.NEUROAPI_PORT}")
         await stop
 
