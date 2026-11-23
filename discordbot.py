@@ -45,6 +45,7 @@ async def main(token):
             super().__init__()
             self.loop = loop
             self.sockets = sockets
+            self.uid_lock = threading.Lock()
             self.uid_map = {} # for Neuro API, speaker ID must be in a uint16,
                               # but Discord has 17-19 digit UID's, so we will
                               # make a map that maps Discord UIDs to a uint16
@@ -55,7 +56,10 @@ async def main(token):
 
             userid = user.id
             username = user.display_name
-            self.uid_map[userid] = len(self.uid_map)
+            with self.uid_lock:
+                if userid not in self.uid_map:
+                    self.uid_map[userid] = len(self.uid_map)
+                    print(f"Assigned {username} ID {self.uid_map[userid]}")
 
             pcm = data.pcm
             if not pcm: return
