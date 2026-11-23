@@ -2,7 +2,9 @@
 # dependencies = [
 #   "httpx",
 #   "pydantic",
-#   "websockets"
+#   "websockets",
+#
+#   "qwen_tokenizer"
 # ]
 # ///
 
@@ -14,6 +16,7 @@ import copy
 import http
 import httpx
 import json
+import os
 import pydantic
 import signal
 import struct
@@ -21,11 +24,25 @@ import time
 import typing
 import websockets
 
+from qwen_tokenizer import get_tokenizer
+TOKENIZER = get_tokenizer("qwen3.5-4b")
+
 
 CLIENTS = set()   # list of ALL clients connected to the main websocket
 ACTIONS = {}      # contains actions for games and clients associated with games
-VOICE_ROUTES = {} # contains routes for voices, and the clients and speakers for a route
 
+# contains routes for voices, and the clients and speakers for a route
+VOICE_ROUTES = {}
+
+# stores the context necessary, as well as caching token length for each line
+# these events are shared for both speech and action generation
+EVENTS = {
+    "lock": None,
+    "timestamp": None,
+    "speech_idx": -1, # set >= 0 to make the speech generator run
+    "msgs": []
+}
+LLAMA_LOCK = None
 
 # JSON encoding validation types
 class Message(pydantic.BaseModel):
@@ -73,7 +90,7 @@ class VoiceSpeakersUnregisterData(pydantic.BaseModel):
 
 # handler for JSON websocket requests
 async def handler(websocket):
-    global CLIENTS, ACTIONS, VOICE_ROUTES
+    global CLIENTS, ACTIONS, VOICE_ROUTES, EVENTS
 
     # if this is for voice, pass it to the voice handler
     if websocket.request.path in VOICE_ROUTES:
@@ -119,6 +136,15 @@ async def handler(websocket):
 
                     try: ContextData.model_validate(data)
                     except: continue
+
+                    async with EVENTS["lock"]:
+                        msg = f"[Event From Game {game}]: {data["message"]}\n"
+                        EVENTS["msgs"] += [{
+                            "msg": msg,
+                            "tokens": len(TOKENIZER.encode(msg))
+                        }]
+                        EVENTS["timestamp"] = round(time.time() * 1000)
+                        print(msg)
                 case "speech/started":
                     pass # TODO
                 case "speech/ended":
@@ -205,13 +231,15 @@ async def handler(websocket):
     finally: CLIENTS.discard(websocket)
 
 
-# handler for voice receive (speech to text)
+# helper functions for voice support
 async def stt_processor():
-    global VOICE_ROUTES
+    # processes speech provided through a /game/<game>/voice websocket
+    # runs speech to text on it
+    global VOICE_ROUTES, EVENTS
+    print("Started speech to text processor!")
 
-    print("Started speech to text processor")
     while True:
-        for _, route in VOICE_ROUTES.items():
+        for route_name, route in VOICE_ROUTES.items():
             for speaker_id, speaker in route["speakers"].items():
                 # create a copy of the speaker segment and info so that the buffer can be cleared
                 # for more streamed in audio packets
@@ -222,45 +250,168 @@ async def stt_processor():
                         speaker["timestamp"] + config.VOICE_THRESHOLD_MS > timestamp):
                         continue
 
+                    # copy over name and segment if necessary
                     speaker_copy["name"] = copy.deepcopy(speaker["name"])
                     speaker_copy["segment"] = copy.deepcopy(speaker["segment"])
-
+                    # reset to get new frames
                     speaker["timestamp"] = None
                     speaker["segment"] = b""
 
-                # convert from 48 kHz mono PCM to something acceptable by whisper.cpp
-                proc = await asyncio.create_subprocess_exec(
-                    "ffmpeg",
-                    "-f", "f32le", "-ar", "48000", "-ac", "1", "-i", "pipe:0",
-                    "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
-                    "-f", "wav", "pipe:1",
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.PIPE,
-                )
-                wav_bytes, err = await proc.communicate(input=bytes(speaker_copy["segment"]))
-                if proc.returncode != 0:
-                    print(f"ffmpeg failed: {err.decode()}")
-                    continue
-
-                async with httpx.AsyncClient() as http_client:
-                    res = await http_client.post(
-                        f"http://{config.WHISPER_IP}:{config.WHISPER_PORT}/inference",
-                        files={"file": ("audio.wav", wav_bytes, "audio/wav")},
-                        data={"temperature": "0.0", "response_formate": "json"},
-                        timeout=60.0
+                # get event lock
+                async with EVENTS["lock"]:
+                    # convert from 48 kHz mono PCM to something acceptable by whisper.cpp (16 kHz, wav)
+                    proc = await asyncio.create_subprocess_exec(
+                        "ffmpeg",
+                        "-f", "f32le", "-ar", "48000", "-ac", "1", "-i", "pipe:0",
+                        "-ar", "16000", "-ac", "1", "-c:a", "pcm_s16le",
+                        "-f", "wav", "pipe:1",
+                        stdin=asyncio.subprocess.PIPE,
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
                     )
-                    transcription = res.json()["text"][1:-1]
-                    print(f"{speaker_copy["name"]} ({speaker_copy["id"]}): {transcription}")
+                    wav_bytes, err = await proc.communicate(input=bytes(speaker_copy["segment"]))
+                    if proc.returncode != 0:
+                        print(f"ffmpeg failed: {err.decode()}")
+                        continue
+
+                    # make the HTTP request to the whisper server
+                    async with httpx.AsyncClient() as http_client:
+                        res = await http_client.post(
+                            f"http://{config.WHISPER_IP}:{config.WHISPER_PORT}/inference",
+                            files={"file": ("audio.wav", wav_bytes, "audio/wav")},
+                            data={"temperature": "0.0", "response_formate": "json"},
+                            timeout=60.0
+                        )
+                        transcription = res.json()["text"][1:-1] # can cut off start (" ") and end ("\n") characters
+                        if transcription == "": continue
+
+                        # route_name[6:-6] is the name of the game that has voice support, it cuts off "/game/" and "/voice"
+                        msg = f"[Voice Chat From {route_name[6:-6]} User {speaker_copy["name"]}]: {transcription}\n"
+                        EVENTS["msgs"] += [{
+                            "msg": msg,
+                            "tokens": len(TOKENIZER.encode(msg))
+                        }]
+                        EVENTS["timestamp"] = round(time.time() * 1000)
+                        print(msg)
+
+                        EVENTS["speech_idx"] = len(EVENTS["msgs"]) # will include up to the latest new event message
 
         await asyncio.sleep(0.01)
 
+# generator that runs the LLM for speech
+# also sends out the websocket request to the clients
+# architecture is heavily inspired by LimitCantCode
+async def speech_gen():
+    global EVENTS, LLAMA_LOCK
+
+    print("Started speech generator!")
+
+    sys_prompt_tokens = len(TOKENIZER.encode(config.SPEECH_SYS_PROMPT))
+    token_budget = int((config.LLAMA_CTX_SIZE - config.SPEECH_MAX_GEN_SIZE - sys_prompt_tokens) * 0.95) # arbitrary 5% token buffer lol
+
+    while True:
+        speech_idx = EVENTS["speech_idx"]
+        if speech_idx < 0:
+            # only run the generator pass once the speech_idx is >= 0
+            await asyncio.sleep(0.01)
+            continue
+
+        async with LLAMA_LOCK:
+            # create prompt
+            events = EVENTS["msgs"][:speech_idx][::-1]
+            prompt = ""
+            prompt_tokens = 0
+            for event in events:
+                # we are cramming as many events as possible into the context if possible
+                if event["tokens"] + prompt_tokens >= token_budget: break
+                prompt = event["msg"] + prompt
+                prompt_tokens += event["tokens"]
+
+            # make request to llama.cpp
+            async with httpx.AsyncClient() as http_client:
+                res = await http_client.post(
+                    f"http://{config.LLAMA_IP}:{config.LLAMA_PORT}/v1/chat/completions",
+                    json={
+                        "model": "local",
+                        "messages": [
+                            {"role": "system", "content": config.SPEECH_SYS_PROMPT},
+                            {"role": "user", "content": prompt}
+                        ],
+                        "temperature": 0.7,
+                        "max_tokens": config.SPEECH_MAX_GEN_SIZE
+                    },
+                    timeout = 60.0
+                )
+                reply = res.json()["choices"][0]["message"]["content"]
+
+                # add response to events
+                async with EVENTS["lock"]:
+                    msg = f"[YOU ({config.DISPLAY_NAME}) SAID]: {reply}\n"
+                    print(msg)
+                    EVENTS["msgs"] += [{
+                        "msg": msg,
+                        "tokens": len(TOKENIZER.encode(msg))
+                    }]
+
+                # get clients to broadcast to
+                targets = set()
+                for _, route in VOICE_ROUTES.items(): targets.update(route["clients"])
+
+                # generate TTS and stream to clients
+                r, w = os.pipe()
+                # using espeak for now
+                espeak = await asyncio.create_subprocess_exec(
+                    "espeak-ng",
+                    "--stdout",
+                    "-v", "en-us+f3",
+                    "-s", "150",
+                    "--", reply,
+                    stdout=w,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                # need to make it match the Neuro API spec
+                ffmpeg = await asyncio.create_subprocess_exec(
+                    "ffmpeg", "-loglevel", "quiet",
+                    "-f", "wav", "-i", "pipe:0",
+                    "-f", "f32le", "-acodec", "pcm_f32le",
+                    "-ar", "48000", "-ac", "1",
+                    "pipe:1",
+                    stdin=r,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                os.close(w)
+                os.close(r)
+                # stream bytes to clients
+                try:
+                    leftover = b""
+                    # 20 ms packets (3840 bytes), 4 bytes per sample
+                    while chunk := await ffmpeg.stdout.read(3840):
+                        data = leftover + chunk
+                        cut = len(data) - len(data) % 4
+                        leftover = data[cut:]
+                        if cut: websockets.broadcast(targets, data[:cut])
+                except: pass # funny haha no errors !!!!!!!
+                finally:
+                    # clean subprocesses
+                    for p in (espeak, ffmpeg):
+                        if p.returncode is None: p.kill()
+                    await p.wait()
+
+            # set the lock to < 0 iff it has not been updated since the start of the generation pass
+            if EVENTS["speech_idx"] != speech_idx: continue
+            async with EVENTS["lock"]: EVENTS["speech_idx"] = -1 # only runs if the speech_idx in EVENTS
+                                                                 # is equal to the speech_idx of the current pass
+
+        await asyncio.sleep(0.01)
+
+# websocket handler for voice receive
 async def voice_recv_handler(websocket):
-    global CLIENTS, ACTIONS, VOICE_ROUTES
+    global CLIENTS, ACTIONS, VOICE_ROUTES, EVENTS
 
     voice_route = VOICE_ROUTES[websocket.request.path]
     VOICE_ROUTES[websocket.request.path]["clients"].add(websocket)
-    print(f"{id(websocket)} connected to core {websocket.request.path}")
+    print(f"{id(websocket)} connected to route {websocket.request.path}")
 
 
     async for message in websocket:
@@ -275,19 +426,26 @@ async def voice_recv_handler(websocket):
         async with speaker["lock"]:
             speaker["timestamp"] = timestamp
             speaker["segment"] += message[4:]
-            
+
 
 # run the server
 def process_request(connection, request):
+    # make a client raise an exception when connecting to an invalid path
     if request.path in VOICE_ROUTES or request.path == "/": return None
     return connection.respond(http.HTTPStatus.NOT_FOUND, "Unknown path\n")
 
 async def main():
+    global EVENTS, LLAMA_LOCK
+
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
     loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
 
-    asyncio.create_task(stt_processor())
+    EVENTS["lock"] = asyncio.Lock()      # put the async lock on the events collection
+    LLAMA_LOCK = asyncio.Lock()
+    asyncio.create_task(stt_processor()) # run the stt processor in the background
+    asyncio.create_task(speech_gen())    # run the speech generator in the background
+
     async with websockets.serve(handler, "0.0.0.0", config.NEUROAPI_PORT, process_request=process_request):
         print(f"Server running on ws://0.0.0.0:{config.NEUROAPI_PORT}")
         await stop

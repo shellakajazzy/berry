@@ -16,6 +16,7 @@ import asyncio
 import json
 import numpy
 import os
+import threading
 import wave
 import websockets
 
@@ -87,14 +88,39 @@ async def main(token):
                 )
             except: return
 
-    # TODO: setup source to send PCM audio
     class PlaybackSource(discord.AudioSource):
-        def __init__(self, loop) -> None:
+        def __init__(self, loop, sockets) -> None:
             super().__init__()
             self.loop = loop
+            self.sockets = sockets
+
+            self.buf = bytearray()
+            self.lock = threading.Lock()
+            async def packet_receive():
+                # receive audio packets from server
+                while True:
+                    try:
+                        async for frame in self.sockets["voice"]:
+                            with self.lock: self.buf += frame
+                    except: await asyncio.sleep(0.01)
+            self.future = asyncio.run_coroutine_threadsafe(packet_receive(), self.loop)
+
         def is_opus(self): return False
         def read(self):
-            pass
+            raw = None 
+
+            with self.lock:
+                # takes in 20ms packets at 48kHZ (3840 bytes):
+                if len(self.buf) < 3840: return b"x\00" * 3480
+                raw = self.buf[:3840]
+                print(raw)
+                del self.buf[:3840]
+
+            # convert to Discord compatible audio from what is received from Neuro API
+            mono = numpy.frombuffer(raw, dtype="<f4")
+            pcm = (numpy.clip(mono, -1.0, 1.0) * 32767).astype("<i2")
+
+            return numpy.repeat(pcm, 2).tobytes()
 
 
     # connect to websockets, and keep retrying
@@ -145,7 +171,7 @@ async def main(token):
         vc = await channel.connect()
         dave = vc.is_dave_connection()
         vc.start_recording(ReceiveSink(bot.loop, sockets))
-        vc.play(PlaybackSource(bot.loop))
+        vc.play(PlaybackSource(bot.loop, sockets))
         print(f"Joined voice channel, DAVE={dave}!")
 
         # connect to websockets w/retries
