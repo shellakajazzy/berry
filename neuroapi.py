@@ -33,12 +33,16 @@ ACTIONS = {}      # contains actions for games and clients associated with games
 
 # contains routes for voices, and the clients and speakers for a route
 VOICE_ROUTES = {}
+SPEECH_STATE = {
+    "lock": None,
+    "end_time": round(time.time() * 1000)
+}
 
 # stores the context necessary, as well as caching token length for each line
 # these events are shared for both speech and action generation
 EVENTS = {
     "lock": None,
-    "timestamp": None,
+    "timestamp": round(time.time() * 1000),
     "speech_idx": -1, # set >= 0 to make the speech generator run
     "msgs": []
 }
@@ -102,7 +106,6 @@ async def handler(websocket):
 
     try:
         async for message in websocket:
-
             msg_json = None
             try:
                 msg_json = json.loads(message)
@@ -157,8 +160,6 @@ async def handler(websocket):
                 case "actions/unregister":
                     try: ActionsUnregisterData.model_validate(data)
                     except: continue
-
-                    pass
                 case "actions/force":
                     try: ActionsForceData.model_validate(data)
                     except: continue
@@ -294,7 +295,10 @@ async def stt_processor():
                         EVENTS["timestamp"] = round(time.time() * 1000)
                         print(msg)
 
-                        EVENTS["speech_idx"] = len(EVENTS["msgs"]) # will include up to the latest new event message
+                        # only respond to current message if we are done speaking the previous time
+                        if round(time.time() * 1000) > SPEECH_STATE["end_time"]:
+                            # will include up to the latest new event message
+                            EVENTS["speech_idx"] = len(EVENTS["msgs"]) # will include up to the latest new event message
 
         await asyncio.sleep(0.01)
 
@@ -316,18 +320,25 @@ async def speech_gen():
             await asyncio.sleep(0.01)
             continue
 
-        async with LLAMA_LOCK:
-            # create prompt
-            events = EVENTS["msgs"][:speech_idx][::-1]
-            prompt = ""
-            prompt_tokens = 0
-            for event in events:
-                # we are cramming as many events as possible into the context if possible
-                if event["tokens"] + prompt_tokens >= token_budget: break
-                prompt = event["msg"] + prompt
-                prompt_tokens += event["tokens"]
+        # don't create a response if the bot is still speaking
+        # this should also cancel the current speech index because otherwise it would try again
+        if round(time.time() * 1000) <= SPEECH_STATE["end_time"]:
+            speech_idx = -1
+            continue
 
-            # make request to llama.cpp
+        # create prompt
+        events = EVENTS["msgs"][:speech_idx][::-1]
+        prompt = ""
+        prompt_tokens = 0
+        for event in events:
+            # we are cramming as many events as possible into the context if possible
+            if event["tokens"] + prompt_tokens >= token_budget: break
+            prompt = event["msg"] + prompt
+            prompt_tokens += event["tokens"]
+
+        # make request to llama.cpp
+        reply = None
+        async with LLAMA_LOCK:
             async with httpx.AsyncClient() as http_client:
                 res = await http_client.post(
                     f"http://{config.LLAMA_IP}:{config.LLAMA_PORT}/v1/chat/completions",
@@ -344,64 +355,69 @@ async def speech_gen():
                 )
                 reply = res.json()["choices"][0]["message"]["content"]
 
-                # add response to events
-                async with EVENTS["lock"]:
-                    msg = f"[YOU ({config.DISPLAY_NAME}) SAID]: {reply}\n"
-                    print(msg)
-                    EVENTS["msgs"] += [{
-                        "msg": msg,
-                        "tokens": len(TOKENIZER.encode(msg))
-                    }]
+        # add response to events
+        async with EVENTS["lock"]:
+            msg = f"[YOU ({config.DISPLAY_NAME}) SAID]: {reply}\n"
+            print(msg)
+            EVENTS["msgs"] += [{
+                "msg": msg,
+                "tokens": len(TOKENIZER.encode(msg))
+            }]
 
-                # get clients to broadcast to
-                targets = set()
-                for _, route in VOICE_ROUTES.items(): targets.update(route["clients"])
+        # get clients to broadcast to
+        targets = set()
+        for _, route in VOICE_ROUTES.items(): targets.update(route["clients"])
 
-                # generate TTS and stream to clients
-                r, w = os.pipe()
-                # using espeak for now
-                espeak = await asyncio.create_subprocess_exec(
-                    "espeak-ng",
-                    "--stdout",
-                    "-v", "en-us+f3",
-                    "-s", "150",
-                    "--", reply,
-                    stdout=w,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                # need to make it match the Neuro API spec
-                ffmpeg = await asyncio.create_subprocess_exec(
-                    "ffmpeg", "-loglevel", "quiet",
-                    "-f", "wav", "-i", "pipe:0",
-                    "-f", "f32le", "-acodec", "pcm_f32le",
-                    "-ar", "48000", "-ac", "1",
-                    "pipe:1",
-                    stdin=r,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                os.close(w)
-                os.close(r)
-                # stream bytes to clients
-                try:
-                    leftover = b""
-                    # 20 ms packets (3840 bytes), 4 bytes per sample
-                    while chunk := await ffmpeg.stdout.read(3840):
-                        data = leftover + chunk
-                        cut = len(data) - len(data) % 4
-                        leftover = data[cut:]
-                        if cut: websockets.broadcast(targets, data[:cut])
-                except: pass # funny haha no errors !!!!!!!
-                finally:
-                    # clean subprocesses
-                    for p in (espeak, ffmpeg):
-                        if p.returncode is None: p.kill()
-                    await p.wait()
+        # generate TTS and stream to clients
+        r, w = os.pipe()
+        # using espeak for now
+        espeak = await asyncio.create_subprocess_exec(
+            "espeak-ng",
+            "--stdout",
+            "-v", "en-us+f3",
+            "-s", "150",
+            "--", reply,
+            stdout=w,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        # need to make it match the Neuro API spec
+        ffmpeg = await asyncio.create_subprocess_exec(
+            "ffmpeg", "-loglevel", "quiet",
+            "-f", "wav", "-i", "pipe:0",
+            "-f", "f32le", "-acodec", "pcm_f32le",
+            "-ar", "48000", "-ac", "1",
+            "pipe:1",
+            stdin=r,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        os.close(w)
+        os.close(r)
 
-            # set the lock to < 0 iff it has not been updated since the start of the generation pass
-            if EVENTS["speech_idx"] != speech_idx: continue
-            async with EVENTS["lock"]: EVENTS["speech_idx"] = -1 # only runs if the speech_idx in EVENTS
-                                                                 # is equal to the speech_idx of the current pass
+        # stream bytes to clients
+        end_time = round(time.time() * 1000)
+        try:
+            leftover = b""
+            # 20 ms packets (3840 bytes), 4 bytes per sample
+            while chunk := await ffmpeg.stdout.read(3840):
+                data = leftover + chunk
+                cut = len(data) - len(data) % 4
+                leftover = data[cut:]
+                if cut:
+                    websockets.broadcast(targets, data[:cut])
+                    end_time += round((len(data[:cut]) / 3840) * 20)
+        except: pass # funny haha no errors !!!!!!!
+        finally:
+            # clean subprocesses
+            for p in (espeak, ffmpeg):
+                if p.returncode is None: p.kill()
+            await p.wait()
+        async with SPEECH_STATE["lock"]: SPEECH_STATE["end_time"] = end_time
+
+        # set the lock to < 0 iff it has not been updated since the start of the generation pass
+        if EVENTS["speech_idx"] != speech_idx: continue
+        async with EVENTS["lock"]: EVENTS["speech_idx"] = -1 # only runs if the speech_idx in EVENTS
+                                                             # is equal to the speech_idx of the current pass
 
         await asyncio.sleep(0.01)
 
@@ -442,6 +458,7 @@ async def main():
     loop.add_signal_handler(signal.SIGTERM, stop.set_result, None)
 
     EVENTS["lock"] = asyncio.Lock()      # put the async lock on the events collection
+    SPEECH_STATE["lock"] = asyncio.Lock()
     LLAMA_LOCK = asyncio.Lock()
     asyncio.create_task(stt_processor()) # run the stt processor in the background
     asyncio.create_task(speech_gen())    # run the speech generator in the background

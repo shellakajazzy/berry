@@ -117,7 +117,6 @@ async def main(token):
                 # takes in 20ms packets at 48kHZ (3840 bytes):
                 if len(self.buf) < 3840: return b"x\00" * 3480
                 raw = self.buf[:3840]
-                print(raw)
                 del self.buf[:3840]
 
             # convert to Discord compatible audio from what is received from Neuro API
