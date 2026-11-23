@@ -100,14 +100,30 @@ async def main(token):
 
             self.buf = bytearray()
             self.lock = threading.Lock()
+            self.speaking = False
+
             async def packet_receive():
-                # receive audio packets from server
+                # receive audio packets from voice server
                 while True:
                     try:
                         async for frame in self.sockets["voice"]:
                             with self.lock: self.buf += frame
                     except: await asyncio.sleep(0.01)
+            async def poll_cancel():
+                # wait for a cancel message from core server
+                while True:
+                    try:
+                        async for msg in self.sockets["core"]:
+                            msg_json = json.loads(msg)
+                            print(msg_json)
+                            if msg_json["command"] == "voice/cancelled":
+                                with self.lock: self.buf = bytearray()
+                                self.speaking = False
+                            elif msg_json["command"] == "voice/speaking":
+                                self.speaking = msg_json["data"]["speaking"]
+                    except: await asyncio.sleep(0.01)
             self.future = asyncio.run_coroutine_threadsafe(packet_receive(), self.loop)
+            self.future = asyncio.run_coroutine_threadsafe(poll_cancel(), self.loop)
 
         def is_opus(self): return False
         def read(self):
@@ -115,7 +131,7 @@ async def main(token):
 
             with self.lock:
                 # takes in 20ms packets at 48kHZ (3840 bytes):
-                if len(self.buf) < 3840: return b"x\00" * 3480
+                if len(self.buf) < 3840 or self.speaking == False: return b"x\00" * 3480
                 raw = self.buf[:3840]
                 del self.buf[:3840]
 
@@ -145,7 +161,6 @@ async def main(token):
                         }))
                         reply = await socket.recv()
                         data = json.loads(reply)
-                        print(data)
                         if data["command"] == "voice/unavailable": raise ValueError("Voice is unavailable")
 
                     await socket.wait_closed()
@@ -180,7 +195,6 @@ async def main(token):
         # connect to websockets w/retries
         asyncio.create_task(ws_maintain(sockets, "core", f"ws://{config.NEUROAPI_IP}:{config.NEUROAPI_PORT}"))
         asyncio.create_task(ws_maintain(sockets, "voice", f"ws://{config.NEUROAPI_IP}:{config.NEUROAPI_PORT}/game/discord/voice"))
-
 
     # capture Ctrl-C
     try:

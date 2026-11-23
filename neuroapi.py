@@ -32,7 +32,10 @@ CLIENTS = set()   # list of ALL clients connected to the main websocket
 ACTIONS = {}      # contains actions for games and clients associated with games
 
 # contains routes for voices, and the clients and speakers for a route
-VOICE_ROUTES = {}
+VOICE_ROUTES = {
+    "clients": set(),
+    "routes": {}
+}
 SPEECH_STATE = {
     "lock": None,
     "end_time": round(time.time() * 1000)
@@ -97,7 +100,7 @@ async def handler(websocket):
     global CLIENTS, ACTIONS, VOICE_ROUTES, EVENTS
 
     # if this is for voice, pass it to the voice handler
-    if websocket.request.path in VOICE_ROUTES:
+    if websocket.request.path in VOICE_ROUTES["routes"]:
         await voice_recv_handler(websocket)
         return
 
@@ -185,12 +188,12 @@ async def handler(websocket):
                         continue
 
                     # create the route
-                    VOICE_ROUTES = {}
-                    if f"/game/{game}/voice" not in VOICE_ROUTES:
-                        VOICE_ROUTES[f"/game/{game}/voice"] = {
+                    if f"/game/{game}/voice" not in VOICE_ROUTES["routes"]:
+                        VOICE_ROUTES["routes"][f"/game/{game}/voice"] = {
                             "clients": set(),
                             "speakers": {}
                         }
+                        VOICE_ROUTES["routes"][f"/game/{game}/voice"]["clients"].add(websocket)
                         print(f"Added voice route for {game} at ws://0.0.0.0/game/{game}/voice")
                     await websocket.send(json.dumps({
                         "command": "voice/ready",
@@ -205,14 +208,15 @@ async def handler(websocket):
                     try: VoiceSpeakersRegisterData.model_validate(data)
                     except: continue
 
+                    voice_route = VOICE_ROUTES["routes"][f"/game/{game}/voice"]
                     for speaker in data["speakers"]:
-                        if speaker["id"] in VOICE_ROUTES[f"/game/{game}/voice"]["speakers"]:
-                            async with VOICE_ROUTES[f"/game/{game}/voice"]["speakers"][speaker["id"]]["lock"]:
-                                if VOICE_ROUTES[f"/game/{game}/voice"]["speakers"][speaker["id"]]["name"] != speaker["name"]:
-                                    VOICE_ROUTES[f"/game/{game}/voice"]["speakers"][speaker["id"]]["name"] = speaker["name"]
+                        if speaker["id"] in voice_route["speakers"]:
+                            async with voice_route["speakers"][speaker["id"]]["lock"]:
+                                if voice_route["speakers"][speaker["id"]]["name"] != speaker["name"]:
+                                    voice_route["speakers"][speaker["id"]]["name"] = speaker["name"]
                                     print(f"Updated name of id {speaker["id"]} with name {speaker["name"]}")
                         else:
-                            VOICE_ROUTES[f"/game/{game}/voice"]["speakers"][speaker["id"]] = {
+                            voice_route["speakers"][speaker["id"]] = {
                                 "lock": asyncio.Lock(),
                                 "name": speaker["name"],
                                 "timestamp": None,
@@ -226,7 +230,7 @@ async def handler(websocket):
                     except: continue
 
                     for speaker_id in data["ids"]:
-                        try: del VOICE_ROUTES[f"/game/{game}/voice"]["speakers"][speaker_id]
+                        try: del VOICE_ROUTES["routes"][f"/game/{game}/voice"]["speakers"][speaker_id]
                         except: continue
     except websockets.ConnectionClosed: pass
     finally: CLIENTS.discard(websocket)
@@ -240,7 +244,7 @@ async def stt_processor():
     print("Started speech to text processor!")
 
     while True:
-        for route_name, route in VOICE_ROUTES.items():
+        for route_name, route in VOICE_ROUTES["routes"].items():
             for speaker_id, speaker in route["speakers"].items():
                 # create a copy of the speaker segment and info so that the buffer can be cleared
                 # for more streamed in audio packets
@@ -296,7 +300,7 @@ async def stt_processor():
                         print(msg)
 
                         # only respond to current message if we are done speaking the previous time
-                        if round(time.time() * 1000) > SPEECH_STATE["end_time"]:
+                        if round(time.time() * 1000) > SPEECH_STATE["end_time"] and EVENTS["speech_idx"] < 0:
                             # will include up to the latest new event message
                             EVENTS["speech_idx"] = len(EVENTS["msgs"]) # will include up to the latest new event message
 
@@ -313,10 +317,15 @@ async def speech_gen():
     sys_prompt_tokens = len(TOKENIZER.encode(config.SPEECH_SYS_PROMPT))
     token_budget = int((config.LLAMA_CTX_SIZE - config.SPEECH_MAX_GEN_SIZE - sys_prompt_tokens) * 0.95) # arbitrary 5% token buffer lol
 
+
     while True:
-        speech_idx = EVENTS["speech_idx"]
-        if speech_idx < 0:
-            # only run the generator pass once the speech_idx is >= 0
+        # get clients connected to core 
+        clients = set()
+        try:
+            for _, route in VOICE_ROUTES["routes"].items():
+                for client in route["clients"]: clients.add(client)
+        except: pass
+        if clients == set():
             await asyncio.sleep(0.01)
             continue
 
@@ -324,6 +333,20 @@ async def speech_gen():
         # this should also cancel the current speech index because otherwise it would try again
         if round(time.time() * 1000) <= SPEECH_STATE["end_time"]:
             speech_idx = -1
+            await asyncio.sleep(0.01)
+            continue
+        else:
+            try:
+                await websockets.broadcast(clients, json.dumps({
+                    "command": "voice/speaking",
+                    "data": { "speaking": False }
+                }))
+            except: pass
+
+        speech_idx = EVENTS["speech_idx"]
+        if speech_idx < 0:
+            # only run the generator pass once the speech_idx is >= 0
+            await asyncio.sleep(0.01)
             continue
 
         # create prompt
@@ -364,13 +387,16 @@ async def speech_gen():
                 "tokens": len(TOKENIZER.encode(msg))
             }]
 
-        # get clients to broadcast to
-        targets = set()
-        for _, route in VOICE_ROUTES.items(): targets.update(route["clients"])
-
         # generate TTS and stream to clients
-        r, w = os.pipe()
+        # enable speech on clients
+        try:
+            await websockets.broadcast(clients, json.dumps({
+                "command": "voice/speaking",
+                "data": { "speaking": True }
+            }))
+        except: pass
         # using espeak for now
+        r, w = os.pipe()
         espeak = await asyncio.create_subprocess_exec(
             "espeak-ng",
             "--stdout",
@@ -404,7 +430,7 @@ async def speech_gen():
                 cut = len(data) - len(data) % 4
                 leftover = data[cut:]
                 if cut:
-                    websockets.broadcast(targets, data[:cut])
+                    websockets.broadcast(VOICE_ROUTES["clients"], data[:cut])
                     end_time += round((len(data[:cut]) / 3840) * 20)
         except: pass # funny haha no errors !!!!!!!
         finally:
@@ -414,21 +440,19 @@ async def speech_gen():
             await p.wait()
         async with SPEECH_STATE["lock"]: SPEECH_STATE["end_time"] = end_time
 
-        # set the lock to < 0 iff it has not been updated since the start of the generation pass
-        if EVENTS["speech_idx"] != speech_idx: continue
-        async with EVENTS["lock"]: EVENTS["speech_idx"] = -1 # only runs if the speech_idx in EVENTS
-                                                             # is equal to the speech_idx of the current pass
+        # reset the speech index
+        async with EVENTS["lock"]: EVENTS["speech_idx"] = -1
 
+        # do other stuff in the meantime
         await asyncio.sleep(0.01)
 
 # websocket handler for voice receive
 async def voice_recv_handler(websocket):
-    global CLIENTS, ACTIONS, VOICE_ROUTES, EVENTS
+    global CLIENTS, ACTIONS, VOICE_ROUTES, SPEECH_STATE, EVENTS
 
-    voice_route = VOICE_ROUTES[websocket.request.path]
-    VOICE_ROUTES[websocket.request.path]["clients"].add(websocket)
+    voice_route = VOICE_ROUTES["routes"][websocket.request.path]
+    VOICE_ROUTES["clients"].add(websocket)
     print(f"{id(websocket)} connected to route {websocket.request.path}")
-
 
     async for message in websocket:
         timestamp = round(time.time() * 1000)
@@ -443,11 +467,43 @@ async def voice_recv_handler(websocket):
             speaker["timestamp"] = timestamp
             speaker["segment"] += message[4:]
 
+        # detect an interrupt from the user to stop the bot's speech
+        # TODO: factor in noise level
+        # TODO: only run the interrupt once
+        segment_ms = (len(speaker["segment"]) / 3840) * 20
+        if segment_ms > config.INTERRUPT_MS and round(time.time() * 1000) <= SPEECH_STATE["end_time"]:
+            print("speech interrupt detected")
+
+            # send the interrupt to all clients
+            try:
+                clients = set()
+                for _, route in VOICE_ROUTES["routes"].items():
+                    for client in route["clients"]: clients.add(client)
+                await websockets.broadcast(clients, json.dumps({
+                    "command": "voice/cancelled"
+                }))
+            except: pass
+
+            # add event about interrupt
+            async with EVENTS["lock"]:
+                msg = f"[SYSTEM]: You ({config.DISPLAY_NAME}) were interrupted by {speaker["name"]}\n"
+                EVENTS["msgs"] += [{
+                    "msg": msg,
+                    "tokens": len(TOKENIZER.encode(msg))
+                }]
+                EVENTS["timestamp"] = round(time.time() * 1000)
+                print(msg)
+
+            # set the end time to right now because the bot has finished speaking
+            async with SPEECH_STATE["lock"]:
+                SPEECH_STATE["end_time"] = round(time.time() * 1000) + 750 # arbitrary 0.75 second cooldown
+
+
 
 # run the server
 def process_request(connection, request):
     # make a client raise an exception when connecting to an invalid path
-    if request.path in VOICE_ROUTES or request.path == "/": return None
+    if request.path in VOICE_ROUTES["routes"] or request.path == "/": return None
     return connection.respond(http.HTTPStatus.NOT_FOUND, "Unknown path\n")
 
 async def main():
