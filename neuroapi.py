@@ -469,57 +469,60 @@ async def voice_recv_handler(websocket):
     VOICE_ROUTES["clients"].add(websocket)
     print(f"{id(websocket)} connected to route {websocket.request.path}")
 
-    async for message in websocket:
-        timestamp = round(time.time() * 1000)
-        speaker_id = int.from_bytes(message[2:4], byteorder="little", signed=False)
-
-        if (speaker_id not in voice_route["speakers"] or
-            type(voice_route["speakers"][speaker_id]["lock"]) != asyncio.Lock):
-            continue
-
-        speaker = voice_route["speakers"][speaker_id]
-        async with speaker["lock"]:
-            speaker["timestamp"] = timestamp
-            speaker["segment"] += message[4:]
-
-        # detect an interrupt from the user to stop the bot's speech
-        async with LAST_INTERRUPT["lock"]:
-            segment_ms = (len(speaker["segment"]) / 3840) * 20
+    try:
+        async for message in websocket:
             timestamp = round(time.time() * 1000)
+            speaker_id = int.from_bytes(message[2:4], byteorder="little", signed=False)
 
-            # rms is used to calculate the average "loudness" of a segment
-            samples = np.frombuffer(speaker["segment"], dtype=np.float32)
-            rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
-            if (segment_ms > config.INTERRUPT_MS and
-                timestamp <= SPEECH_STATE["end_time"] and
-                timestamp > LAST_INTERRUPT["timestamp"] + config.INTERRUPT_COOLDOWN_MS and
-                rms >= config.SPEECH_RMS):
-                print("speech interrupt detected")
+            if (speaker_id not in voice_route["speakers"] or
+                type(voice_route["speakers"][speaker_id]["lock"]) != asyncio.Lock):
+                continue
 
-                # send the interrupt to all clients
-                try:
-                    clients = set()
-                    for _, route in VOICE_ROUTES["routes"].items():
-                        for client in route["clients"]: clients.add(client)
-                    await websockets.broadcast(clients, json.dumps({
-                        "command": "voice/cancelled"
-                    }))
-                except: pass
+            speaker = voice_route["speakers"][speaker_id]
+            async with speaker["lock"]:
+                speaker["timestamp"] = timestamp
+                speaker["segment"] += message[4:]
 
-                # add event about interrupt
-                async with EVENTS["lock"]:
-                    msg = f"[SYSTEM]: You ({config.DISPLAY_NAME}) were interrupted by {speaker["name"]}\n"
-                    EVENTS["msgs"] += [{
-                        "msg": msg,
-                        "tokens": len(TOKENIZER.encode(msg))
-                    }]
-                    EVENTS["timestamp"] = round(time.time() * 1000)
-                    LAST_INTERRUPT["timestamp"] = round(time.time() * 1000)
-                    print(msg)
+            # detect an interrupt from the user to stop the bot's speech
+            async with LAST_INTERRUPT["lock"]:
+                segment_ms = (len(speaker["segment"]) / 3840) * 20
+                timestamp = round(time.time() * 1000)
 
-                # set the end time to right now because the bot has finished speaking
-                async with SPEECH_STATE["lock"]:
-                    SPEECH_STATE["end_time"] = round(time.time() * 1000) + config.INTERRUPT_COOLDOWN_MS # arbitrary cooldown
+                # rms is used to calculate the average "loudness" of a segment
+                samples = np.frombuffer(speaker["segment"], dtype=np.float32)
+                rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+                if (segment_ms > config.INTERRUPT_MS and
+                    timestamp <= SPEECH_STATE["end_time"] and
+                    timestamp > LAST_INTERRUPT["timestamp"] + config.INTERRUPT_COOLDOWN_MS and
+                    rms >= config.SPEECH_RMS):
+                    print("speech interrupt detected")
+
+                    # send the interrupt to all clients
+                    try:
+                        clients = set()
+                        for _, route in VOICE_ROUTES["routes"].items():
+                            for client in route["clients"]: clients.add(client)
+                        await websockets.broadcast(clients, json.dumps({
+                            "command": "voice/cancelled"
+                        }))
+                    except: pass
+
+                    # add event about interrupt
+                    async with EVENTS["lock"]:
+                        msg = f"[SYSTEM]: You ({config.DISPLAY_NAME}) were interrupted by {speaker["name"]}\n"
+                        EVENTS["msgs"] += [{
+                            "msg": msg,
+                            "tokens": len(TOKENIZER.encode(msg))
+                        }]
+                        EVENTS["timestamp"] = round(time.time() * 1000)
+                        LAST_INTERRUPT["timestamp"] = round(time.time() * 1000)
+                        print(msg)
+
+                    # set the end time to right now because the bot has finished speaking
+                    async with SPEECH_STATE["lock"]:
+                        SPEECH_STATE["end_time"] = round(time.time() * 1000) + config.INTERRUPT_COOLDOWN_MS # arbitrary cooldown
+    except websockets.ConnectionClosed: pass
+    finally: VOICE_ROUTES["clients"].discard(websocket)
 
 
 

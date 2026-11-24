@@ -39,12 +39,21 @@ async def main(token):
     intents.message_content = True
     bot = commands.Bot(command_prefix="!", intents=intents)
 
+    # only contains the voice websocket for voice send and receive packets, not JSON
+    sockets = {
+        "core": None,
+        "voice": None
+    }
+    maintain_websockets = True
+
+    # asyncio tasks that need to be finished
+    tasks = []
+
     # setup sink to receive PCM audio
     class ReceiveSink(Sink):
-        def __init__(self, loop, sockets) -> None:
+        def __init__(self, loop) -> None:
             super().__init__()
             self.loop = loop
-            self.sockets = sockets
             self.uid_lock = threading.Lock()
             self.uid_map = {} # for Neuro API, speaker ID must be in a uint16,
                               # but Discord has 17-19 digit UID's, so we will
@@ -72,7 +81,7 @@ async def main(token):
                 # register user, easier to do it everytime so that everything is always up to date,
                 # and also registering shouldn't take too much time
                 asyncio.run_coroutine_threadsafe(
-                    self.sockets["core"].send(json.dumps({
+                    sockets["core"].send(json.dumps({
                         "command": "voice/speakers/register",
                         "game": "discord",
                         "data": {
@@ -87,16 +96,15 @@ async def main(token):
 
                 # send the voice packet
                 asyncio.run_coroutine_threadsafe(
-                    self.sockets["voice"].send(voice_payload),
+                    sockets["voice"].send(voice_payload),
                     self.loop
                 )
             except: return
 
     class PlaybackSource(discord.AudioSource):
-        def __init__(self, loop, sockets) -> None:
+        def __init__(self, loop) -> None:
             super().__init__()
             self.loop = loop
-            self.sockets = sockets
 
             self.buf = bytearray()
             self.lock = threading.Lock()
@@ -106,24 +114,23 @@ async def main(token):
                 # receive audio packets from voice server
                 while True:
                     try:
-                        async for frame in self.sockets["voice"]:
+                        async for frame in sockets["voice"]:
                             with self.lock: self.buf += frame
                     except: await asyncio.sleep(0.01)
             async def poll_cancel():
                 # wait for a cancel message from core server
                 while True:
                     try:
-                        async for msg in self.sockets["core"]:
+                        async for msg in sockets["core"]:
                             msg_json = json.loads(msg)
-                            print(msg_json)
                             if msg_json["command"] == "voice/cancelled":
                                 with self.lock: self.buf = bytearray()
                                 self.speaking = False
                             elif msg_json["command"] == "voice/speaking":
                                 self.speaking = msg_json["data"]["speaking"]
                     except: await asyncio.sleep(0.01)
-            self.future = asyncio.run_coroutine_threadsafe(packet_receive(), self.loop)
-            self.future = asyncio.run_coroutine_threadsafe(poll_cancel(), self.loop)
+            self.recv_future = asyncio.run_coroutine_threadsafe(packet_receive(), self.loop)
+            self.cancel_future = asyncio.run_coroutine_threadsafe(poll_cancel(), self.loop)
 
         def is_opus(self): return False
         def read(self):
@@ -143,11 +150,10 @@ async def main(token):
 
 
     # connect to websockets, and keep retrying
-    tasks = []
-    async def ws_maintain(sockets, name, url):
+    async def ws_maintain(name, url):
         if name not in ["core", "voice"]: return
 
-        while True:
+        while maintain_websockets == True:
             try:
                 async with websockets.connect(url) as socket:
                     sockets[name] = socket
@@ -176,11 +182,6 @@ async def main(token):
     async def on_ready() -> None:
         print(f"Logged in as {bot.user}")
 
-        # only contains the voice websocket for voice send and receive packets, not JSON
-        sockets = {
-            "core": None,
-            "voice": None
-        }
 
         # join VC and setup sink/source
         print("Joining channel...")
@@ -188,13 +189,13 @@ async def main(token):
         channel = guild.get_channel(config.DISCORD_CHANNEL_ID)
         vc = await channel.connect()
         dave = vc.is_dave_connection()
-        vc.start_recording(ReceiveSink(bot.loop, sockets))
-        vc.play(PlaybackSource(bot.loop, sockets))
+        vc.start_recording(ReceiveSink(bot.loop))
+        vc.play(PlaybackSource(bot.loop))
         print(f"Joined voice channel, DAVE={dave}!")
 
         # connect to websockets w/retries
-        asyncio.create_task(ws_maintain(sockets, "core", f"ws://{config.NEUROAPI_IP}:{config.NEUROAPI_PORT}"))
-        asyncio.create_task(ws_maintain(sockets, "voice", f"ws://{config.NEUROAPI_IP}:{config.NEUROAPI_PORT}/game/discord/voice"))
+        asyncio.create_task(ws_maintain("core", f"ws://{config.NEUROAPI_IP}:{config.NEUROAPI_PORT}"))
+        asyncio.create_task(ws_maintain("voice", f"ws://{config.NEUROAPI_IP}:{config.NEUROAPI_PORT}/game/discord/voice"))
 
     # capture Ctrl-C
     try:
@@ -203,7 +204,20 @@ async def main(token):
         while True: pass
     except asyncio.CancelledError:
         print("\n\nPress Ctrl-C again...")
+        maintain_websockets = False
+        if type(sockets["core"]) == websockets.asyncio.client.ClientConnection:
+            await sockets["core"].send(json.dumps({
+                "command": "voice/stop",
+                "game": "discord"
+            }))
+            print("Sent voice/stop websocket message")
+            print("\nPress Ctrl-C again...")
+        for _, socket in sockets.items():
+            if type(socket) != websockets.asyncio.client.ClientConnection: continue
+            await socket.close()
+        print("\nClosed websocket connections.")
 
+        print("\nPress Ctrl-C again...")
         guild = bot.get_guild(config.DISCORD_GUILD_ID)
         vc = guild.voice_client
         await vc.disconnect()
