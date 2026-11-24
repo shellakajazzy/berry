@@ -1,6 +1,7 @@
 # /// script
 # dependencies = [
 #   "httpx",
+#   "numpy",
 #   "pydantic",
 #   "websockets",
 #
@@ -16,6 +17,7 @@ import copy
 import http
 import httpx
 import json
+import numpy as np
 import os
 import pydantic
 import signal
@@ -39,6 +41,10 @@ VOICE_ROUTES = {
 SPEECH_STATE = {
     "lock": None,
     "end_time": round(time.time() * 1000)
+}
+LAST_INTERRUPT = {
+    "lock": None,
+    "timestamp": round(time.time() * 1000)
 }
 
 # stores the context necessary, as well as caching token length for each line
@@ -262,6 +268,12 @@ async def stt_processor():
                     speaker["timestamp"] = None
                     speaker["segment"] = b""
 
+                # if the sample is neither long enough nor loud enough, it should be discarded
+                samples = np.frombuffer(speaker_copy["segment"], dtype=np.float32)
+                rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+                # 150000 is about 800 ms of speech (if im not bad at math)
+                if rms <= config.SPEECH_RMS or len(speaker_copy["segment"]) <= 150000: continue
+
                 # get event lock
                 async with EVENTS["lock"]:
                     # convert from 48 kHz mono PCM to something acceptable by whisper.cpp (16 kHz, wav)
@@ -281,6 +293,7 @@ async def stt_processor():
 
                     # make the HTTP request to the whisper server
                     async with httpx.AsyncClient() as http_client:
+                        print("Transcribing...")
                         res = await http_client.post(
                             f"http://{config.WHISPER_IP}:{config.WHISPER_PORT}/inference",
                             files={"file": ("audio.wav", wav_bytes, "audio/wav")},
@@ -363,6 +376,7 @@ async def speech_gen():
         reply = None
         async with LLAMA_LOCK:
             async with httpx.AsyncClient() as http_client:
+                print("Speech generation...")
                 res = await http_client.post(
                     f"http://{config.LLAMA_IP}:{config.LLAMA_PORT}/v1/chat/completions",
                     json={
@@ -395,13 +409,14 @@ async def speech_gen():
                 "data": { "speaking": True }
             }))
         except: pass
+        print("Speaking...")
         # using espeak for now
         r, w = os.pipe()
         espeak = await asyncio.create_subprocess_exec(
             "espeak-ng",
             "--stdout",
             "-v", "en-us+f3",
-            "-s", "150",
+            "-s", "200",
             "--", reply,
             stdout=w,
             stderr=asyncio.subprocess.DEVNULL
@@ -448,7 +463,7 @@ async def speech_gen():
 
 # websocket handler for voice receive
 async def voice_recv_handler(websocket):
-    global CLIENTS, ACTIONS, VOICE_ROUTES, SPEECH_STATE, EVENTS
+    global CLIENTS, ACTIONS, VOICE_ROUTES, SPEECH_STATE, EVENTS, LAST_INTERRUPT
 
     voice_route = VOICE_ROUTES["routes"][websocket.request.path]
     VOICE_ROUTES["clients"].add(websocket)
@@ -468,35 +483,43 @@ async def voice_recv_handler(websocket):
             speaker["segment"] += message[4:]
 
         # detect an interrupt from the user to stop the bot's speech
-        # TODO: factor in noise level
-        # TODO: only run the interrupt once
-        segment_ms = (len(speaker["segment"]) / 3840) * 20
-        if segment_ms > config.INTERRUPT_MS and round(time.time() * 1000) <= SPEECH_STATE["end_time"]:
-            print("speech interrupt detected")
+        async with LAST_INTERRUPT["lock"]:
+            segment_ms = (len(speaker["segment"]) / 3840) * 20
+            timestamp = round(time.time() * 1000)
 
-            # send the interrupt to all clients
-            try:
-                clients = set()
-                for _, route in VOICE_ROUTES["routes"].items():
-                    for client in route["clients"]: clients.add(client)
-                await websockets.broadcast(clients, json.dumps({
-                    "command": "voice/cancelled"
-                }))
-            except: pass
+            # rms is used to calculate the average "loudness" of a segment
+            samples = np.frombuffer(speaker["segment"], dtype=np.float32)
+            rms = float(np.sqrt(np.mean(samples.astype(np.float64) ** 2)))
+            if (segment_ms > config.INTERRUPT_MS and
+                timestamp <= SPEECH_STATE["end_time"] and
+                timestamp > LAST_INTERRUPT["timestamp"] + config.INTERRUPT_COOLDOWN_MS and
+                rms >= config.SPEECH_RMS):
+                print("speech interrupt detected")
 
-            # add event about interrupt
-            async with EVENTS["lock"]:
-                msg = f"[SYSTEM]: You ({config.DISPLAY_NAME}) were interrupted by {speaker["name"]}\n"
-                EVENTS["msgs"] += [{
-                    "msg": msg,
-                    "tokens": len(TOKENIZER.encode(msg))
-                }]
-                EVENTS["timestamp"] = round(time.time() * 1000)
-                print(msg)
+                # send the interrupt to all clients
+                try:
+                    clients = set()
+                    for _, route in VOICE_ROUTES["routes"].items():
+                        for client in route["clients"]: clients.add(client)
+                    await websockets.broadcast(clients, json.dumps({
+                        "command": "voice/cancelled"
+                    }))
+                except: pass
 
-            # set the end time to right now because the bot has finished speaking
-            async with SPEECH_STATE["lock"]:
-                SPEECH_STATE["end_time"] = round(time.time() * 1000) + 750 # arbitrary 0.75 second cooldown
+                # add event about interrupt
+                async with EVENTS["lock"]:
+                    msg = f"[SYSTEM]: You ({config.DISPLAY_NAME}) were interrupted by {speaker["name"]}\n"
+                    EVENTS["msgs"] += [{
+                        "msg": msg,
+                        "tokens": len(TOKENIZER.encode(msg))
+                    }]
+                    EVENTS["timestamp"] = round(time.time() * 1000)
+                    LAST_INTERRUPT["timestamp"] = round(time.time() * 1000)
+                    print(msg)
+
+                # set the end time to right now because the bot has finished speaking
+                async with SPEECH_STATE["lock"]:
+                    SPEECH_STATE["end_time"] = round(time.time() * 1000) + config.INTERRUPT_COOLDOWN_MS # arbitrary cooldown
 
 
 
@@ -507,7 +530,7 @@ def process_request(connection, request):
     return connection.respond(http.HTTPStatus.NOT_FOUND, "Unknown path\n")
 
 async def main():
-    global EVENTS, LLAMA_LOCK
+    global EVENTS, LLAMA_LOCK, SPEECH_STATE, LAST_INTERRUPT
 
     loop = asyncio.get_running_loop()
     stop = loop.create_future()
@@ -515,6 +538,7 @@ async def main():
 
     EVENTS["lock"] = asyncio.Lock()      # put the async lock on the events collection
     SPEECH_STATE["lock"] = asyncio.Lock()
+    LAST_INTERRUPT["lock"] = asyncio.Lock()
     LLAMA_LOCK = asyncio.Lock()
     asyncio.create_task(stt_processor()) # run the stt processor in the background
     asyncio.create_task(speech_gen())    # run the speech generator in the background
